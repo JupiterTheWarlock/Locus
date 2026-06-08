@@ -27,6 +27,7 @@ pub mod knowledge_index;
 pub mod knowledge_store;
 mod knowledge_watcher;
 mod llm;
+pub mod local_reference;
 pub(crate) mod merge;
 pub mod network;
 pub mod plugin;
@@ -1102,6 +1103,7 @@ pub fn run() {
             commands::knowledge_get_unity_reference_import_status,
             commands::knowledge_find_unity_reference_directory,
             commands::knowledge_get_feishu_reference_import_status,
+            commands::knowledge_get_local_reference_import_status,
             commands::knowledge_save_feishu_reference_config,
             commands::knowledge_test_feishu_reference_connection,
             commands::knowledge_start_feishu_reference_oauth,
@@ -1109,6 +1111,7 @@ pub fn run() {
             commands::knowledge_list_feishu_reference_space_nodes,
             commands::knowledge_cancel_unity_reference_import,
             commands::knowledge_cancel_feishu_reference_import,
+            commands::knowledge_cancel_local_reference_import,
             commands::knowledge_list,
             commands::knowledge_list_page,
             commands::knowledge_list_directories,
@@ -1120,6 +1123,8 @@ pub fn run() {
             commands::knowledge_read,
             commands::knowledge_import_unity_reference_docs,
             commands::knowledge_import_feishu_reference_docs,
+            commands::knowledge_import_local_reference_source,
+            commands::knowledge_sync_local_reference_source,
             commands::knowledge_delete_unity_reference_docs,
             commands::knowledge_delete_feishu_reference_docs,
             commands::knowledge_delete_external_reference_directory,

@@ -3195,9 +3195,18 @@ fn ensure_unity_reference_store_schema(conn: &Connection) -> Result<(), String> 
 }
 
 fn open_unity_reference_store_readonly(path: &Path) -> Result<Connection, String> {
+    let mut uri = Url::from_file_path(path).map_err(|_| {
+        format!(
+            "Failed to build Unity reference store URI '{}'",
+            path.display()
+        )
+    })?;
+    uri.set_query(Some("mode=ro&immutable=1"));
     Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        uri.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| {
         format!(

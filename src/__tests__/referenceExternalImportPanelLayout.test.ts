@@ -12,8 +12,14 @@ describe("ReferenceExternalImportPanel layout", () => {
   it("keeps source selection ahead of inline provider configuration", () => {
     const panel = read("src/components/knowledge/ReferenceExternalImportPanel.vue");
 
-    expect(panel).toContain('export type ExternalImportSource = "feishu" | "unity"');
+    expect(panel).toContain('export type ExternalImportSource = "feishu" | "unity" | "local_folder"');
+    expect(panel).toContain('initialSource: "local_folder"');
     expect(panel).toContain("const activeSource = ref<ExternalImportSource>(props.initialSource)");
+    expect(panel).toContain('import { open } from "@tauri-apps/plugin-dialog"');
+    expect(panel).toContain('import BaseSwitch from "../ui/BaseSwitch.vue"');
+    expect(panel).toContain("knowledgeImportLocalReferenceSource");
+    expect(panel).toContain("knowledgeSyncLocalReferenceSource");
+    expect(panel).toContain("knowledgeGetLocalReferenceImportStatus");
     expect(panel).toContain("knowledgeSaveFeishuReferenceConfig");
     expect(panel).toContain("knowledgeImportFeishuReferenceDocs");
     expect(panel).toContain("knowledgeImportUnityReferenceDocs");
@@ -32,6 +38,18 @@ describe("ReferenceExternalImportPanel layout", () => {
     expect(panel).toContain('feishuAuthMode.value !== "oauth" || feishuOauthAuthorizedForCurrentConfig.value');
     expect(panel).toContain("const feishuCanContinueConnectionStep = computed(() =>");
     expect(panel).toContain("const windowSourceOptions = computed(() => [");
+    expect(panel).toContain('value: "local_folder"');
+    expect(panel).toContain('t("knowledge.referenceFolder.external.sourceLocalFolder")');
+    expect(panel).toContain('t("knowledge.localReference.title")');
+    expect(panel).toContain('t("knowledge.localReference.syncEnabledHint")');
+    expect(panel).toContain('v-if="activeSource === \'local_folder\'"');
+    expect(panel).toContain('v-else-if="activeSource === \'local_folder\'"');
+    expect(panel).toContain('class="reference-local-sync-config"');
+    expect(panel).toContain('class="reference-field-stack reference-local-source-field"');
+    expect(panel).toContain("<BaseSwitch");
+    expect(panel).not.toContain("reference-switch-row");
+    expect(panel).not.toContain('class="reference-check-row"');
+    expect(panel).not.toContain('type="checkbox"');
     expect(panel).toContain('import ReferenceExternalImportFeishuWindowFlow from "./externalImport/ReferenceExternalImportFeishuWindowFlow.vue"');
     expect(panel).toContain('import ReferenceExternalImportUnityWindowPane from "./externalImport/ReferenceExternalImportUnityWindowPane.vue"');
     expect(panel).toContain('import { useNotificationStore } from "../../stores/notification"');

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
@@ -7,17 +8,21 @@ import { useNotificationStore } from "../../stores/notification";
 import {
   knowledgeCancelFeishuReferenceImport,
   knowledgeCancelFeishuReferenceOauthWait,
+  knowledgeCancelLocalReferenceImport,
   knowledgeCancelUnityReferenceImport,
   knowledgeCreate,
   knowledgeFindUnityReferenceDirectory,
   knowledgeGetFeishuReferenceImportStatus,
+  knowledgeGetLocalReferenceImportStatus,
   knowledgeGetUnityReferenceImportStatus,
   knowledgeImportFeishuReferenceDocs,
+  knowledgeImportLocalReferenceSource,
   knowledgeImportUnityReferenceDocs,
   knowledgeListFeishuReferenceSpaceNodes,
   knowledgeListDirectories,
   knowledgeSaveFeishuReferenceConfig,
   knowledgeStartFeishuReferenceOauth,
+  knowledgeSyncLocalReferenceSource,
   knowledgeTestFeishuReferenceConnection,
 } from "../../services/knowledge";
 import type {
@@ -29,12 +34,15 @@ import type {
   FeishuReferenceOauthPersistenceMode,
   FeishuReferenceRootSelection,
   KnowledgeDirectoryConfigRecord,
+  LocalReferenceImportReport,
+  LocalReferenceImportStatus,
   UnityReferenceImportLocale,
   UnityReferenceImportStatus,
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
+import BaseSwitch from "../ui/BaseSwitch.vue";
 import ReferenceExternalImportFeishuWindowFlow from "./externalImport/ReferenceExternalImportFeishuWindowFlow.vue";
 import ReferenceExternalImportUnityWindowPane from "./externalImport/ReferenceExternalImportUnityWindowPane.vue";
 import {
@@ -48,7 +56,7 @@ import type {
 
 const notificationStore = useNotificationStore();
 
-export type ExternalImportSource = "feishu" | "unity";
+export type ExternalImportSource = "feishu" | "unity" | "local_folder";
 
 interface SpaceOption {
   spaceId: string;
@@ -88,7 +96,7 @@ const props = withDefaults(defineProps<{
   mode: "dialog",
   parentDir: "",
   fixedTargetPath: null,
-  initialSource: "feishu",
+  initialSource: "local_folder",
   directory: null,
   pathExists: null,
   ensureDirectory: null,
@@ -105,6 +113,7 @@ const emit = defineEmits<{
 
 const DEFAULT_FEISHU_BASE_DIR = "feishu-knowledge-base";
 const DEFAULT_FEISHU_OPEN_BASE_URL = "https://open.feishu.cn";
+const DEFAULT_LOCAL_REFERENCE_DIR = "local-reference";
 const DEFAULT_UNITY_DIR = "unity-official-docs";
 const UNITY_IMPORT_STAGE_ORDER = [
   "resolving_source",
@@ -217,6 +226,7 @@ function preferredSourceFromDirectory(
   const sources = Array.isArray(directory?.externalSources)
     ? directory?.externalSources ?? []
     : [];
+  if (sources.some((source) => source.provider === "local_folder")) return "local_folder";
   if (sources.some((source) => source.provider === "unity")) return "unity";
   if (sources.some((source) => source.provider === "feishu")) return "feishu";
   return null;
@@ -432,11 +442,153 @@ function externalSourceProviders(): ExternalImportSource[] {
   for (const source of sources) {
     if (source.provider === "feishu") providers.add("feishu");
     if (source.provider === "unity") providers.add("unity");
+    if (source.provider === "local_folder") providers.add("local_folder");
   }
   return Array.from(providers.values());
 }
 
 const boundProviders = computed(() => externalSourceProviders());
+
+// Local folder snapshots
+const localSourcePath = ref("");
+const localMaterializedTargetPath = ref("");
+const localStatus = ref<LocalReferenceImportStatus | null>(null);
+const localReport = ref<LocalReferenceImportReport | null>(null);
+const localError = ref("");
+const localImportPending = ref(false);
+const localSyncPending = ref(false);
+const localCancelPending = ref(false);
+const localSyncEnabled = ref(true);
+
+function localSourceBaseName(path: string): string {
+  const normalized = normalizeRelativePath(path);
+  if (!normalized) return DEFAULT_LOCAL_REFERENCE_DIR;
+  const [last] = normalized.split("/").filter(Boolean).slice(-1);
+  return sanitizePathSegment(last || DEFAULT_LOCAL_REFERENCE_DIR, DEFAULT_LOCAL_REFERENCE_DIR);
+}
+
+const localComputedTargetPath = computed(() => {
+  const baseName = localSourceBaseName(localSourcePath.value);
+  const basePath = joinRelativePath(normalizedParentDir.value, baseName);
+  return resolveStableExternalImportTargetPath({
+    fixedTargetPath: fixedTargetPath.value,
+    materializedTargetPath: localMaterializedTargetPath.value,
+    basePath,
+    pathExists: props.pathExists ?? localPathExists,
+  });
+});
+const localTargetPath = computed(() => fixedTargetPath.value || localComputedTargetPath.value);
+const localTargetPathLabel = computed(() =>
+  localTargetPath.value
+    ? referencePathLabel(localTargetPath.value)
+    : t("knowledge.referenceFolder.external.targetPending"),
+);
+const localCurrentStatusTargetPath = computed(() =>
+  fixedTargetPath.value || localMaterializedTargetPath.value || "",
+);
+const localImportedAtLabel = computed(() => formatDateTime(localStatus.value?.importedAt));
+const localCanImport = computed(() =>
+  !!trimOrEmpty(localSourcePath.value)
+  && !!localTargetPath.value
+  && !localImportPending.value
+  && !localSyncPending.value,
+);
+const localCanSync = computed(() =>
+  !!trimOrEmpty(localStatus.value?.targetPath || localCurrentStatusTargetPath.value)
+  && localStatus.value?.state !== "missing"
+  && !localImportPending.value
+  && !localSyncPending.value,
+);
+const localSummaryMessage = computed(() =>
+  trimOrEmpty(localError.value)
+  || (localStatus.value?.state !== "missing" ? trimOrEmpty(localStatus.value?.error) : "")
+  || trimOrEmpty(localStatus.value?.message)
+  || t("knowledge.localReference.subtitle"),
+);
+
+async function chooseLocalReferenceSource(directory: boolean) {
+  const selected = await open({
+    directory,
+    multiple: false,
+    title: t(directory ? "knowledge.localReference.chooseFolder" : "knowledge.localReference.chooseFile"),
+    filters: directory
+      ? undefined
+      : [{ name: "Text", extensions: ["md", "markdown", "txt"] }],
+  });
+  const value = Array.isArray(selected) ? selected[0] : selected;
+  if (typeof value !== "string" || !value) return;
+  localSourcePath.value = value;
+  localError.value = "";
+  localReport.value = null;
+}
+
+async function refreshLocalStatus() {
+  try {
+    localStatus.value = await knowledgeGetLocalReferenceImportStatus(
+      trimOrEmpty(localCurrentStatusTargetPath.value) || undefined,
+    );
+    localError.value = "";
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  }
+}
+
+async function startLocalImport() {
+  if (!localCanImport.value) return;
+  localImportPending.value = true;
+  localError.value = "";
+  try {
+    const targetPath = localTargetPath.value;
+    if (!targetPath) {
+      throw new Error(t("knowledge.referenceFolder.external.targetPending"));
+    }
+    const report = await knowledgeImportLocalReferenceSource({
+      sourcePath: trimOrEmpty(localSourcePath.value),
+      targetPath,
+      syncEnabled: localSyncEnabled.value,
+    });
+    localReport.value = report;
+    localMaterializedTargetPath.value = report.targetPath || targetPath;
+    await focusDirectory(report.targetPath || targetPath, true);
+    await refreshLocalStatus();
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  } finally {
+    localImportPending.value = false;
+  }
+}
+
+async function syncLocalImport() {
+  const targetPath = trimOrEmpty(localStatus.value?.targetPath || localCurrentStatusTargetPath.value);
+  if (!targetPath || localSyncPending.value) return;
+  localSyncPending.value = true;
+  localError.value = "";
+  try {
+    const report = await knowledgeSyncLocalReferenceSource(targetPath);
+    localReport.value = report;
+    localMaterializedTargetPath.value = report.targetPath || targetPath;
+    await focusDirectory(report.targetPath || targetPath, true);
+    await refreshLocalStatus();
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  } finally {
+    localSyncPending.value = false;
+  }
+}
+
+async function cancelLocalImport() {
+  localCancelPending.value = true;
+  localError.value = "";
+  try {
+    localStatus.value = await knowledgeCancelLocalReferenceImport(
+      trimOrEmpty(localCurrentStatusTargetPath.value) || undefined,
+    );
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  } finally {
+    localCancelPending.value = false;
+  }
+}
 
 // Unity
 const unitySelectedLocale = ref<UnityReferenceImportLocale>("en");
@@ -1315,13 +1467,21 @@ const isWindowBusy = computed(() =>
   isRunning.value
   || unityStartPending.value
   || unityCancelPending.value
+  || localImportPending.value
+  || localSyncPending.value
+  || localCancelPending.value
   || feishuSavePending.value
   || feishuImportPending.value
   || feishuCancelImportPending.value,
 );
-const canClose = computed(() => !unityStartPending.value && !feishuSavePending.value);
+const canClose = computed(() => !unityStartPending.value && !localImportPending.value && !feishuSavePending.value);
 const disableSourceSwitch = computed(() => isRunning.value);
 const inlineSourceOptions = computed(() => [
+  {
+    value: "local_folder",
+    label: t("knowledge.referenceFolder.external.sourceLocalFolder"),
+    disabled: disableSourceSwitch.value,
+  },
   {
     value: "feishu",
     label: t("knowledge.referenceFolder.external.sourceFeishu"),
@@ -1334,6 +1494,11 @@ const inlineSourceOptions = computed(() => [
   },
 ]);
 const windowSourceOptions = computed(() => [
+  {
+    value: "local_folder",
+    label: t("knowledge.localReference.title"),
+    disabled: disableSourceSwitch.value,
+  },
   {
     value: "feishu",
     label: t("knowledge.feishuReference.title"),
@@ -1361,7 +1526,11 @@ const feishuSummaryMessage = computed(() =>
   || t("knowledge.feishuReference.window.subtitle"),
 );
 const windowTargetPathLabel = computed(() =>
-  activeSource.value === "unity" ? unityTargetPathLabel.value : feishuTargetPathLabel.value,
+  activeSource.value === "unity"
+    ? unityTargetPathLabel.value
+    : activeSource.value === "local_folder"
+      ? localTargetPathLabel.value
+      : feishuTargetPathLabel.value,
 );
 const windowTargetPathHint = computed(() => {
   if (activeSource.value === "unity" && unityExistingPath.value && unityExistingPath.value === unityTargetPath.value) {
@@ -1567,6 +1736,10 @@ watch(
       void loadUnityExistingDirectory().then(() => refreshUnityStatus());
       return;
     }
+    if (source === "local_folder") {
+      void refreshLocalStatus();
+      return;
+    }
     void refreshFeishuStatus();
     if (trimOrEmpty(feishuSelectedSpaceId.value)) {
       void loadFeishuRootNodes();
@@ -1596,9 +1769,14 @@ watch(
     unityMaterializedTargetPath.value = "";
     unityImportSessionStarted.value = false;
     unityCloseAfterSuccess.value = false;
+    localMaterializedTargetPath.value = "";
     feishuMaterializedTargetPath.value = "";
     if (activeSource.value === "unity") {
       void loadUnityExistingDirectory().then(() => refreshUnityStatus());
+      return;
+    }
+    if (activeSource.value === "local_folder") {
+      void refreshLocalStatus();
       return;
     }
     void refreshFeishuStatus();
@@ -1651,6 +1829,23 @@ onUnmounted(() => {
       </div>
       </div>
 
+      <div v-if="activeSource === 'local_folder'" class="reference-local-sync-config">
+        <div class="reference-local-sync-copy">
+          <div class="reference-local-sync-label">
+            {{ t("knowledge.localReference.syncEnabled") }}
+          </div>
+          <div class="reference-local-sync-hint">
+            {{ t("knowledge.localReference.syncEnabledHint") }}
+          </div>
+        </div>
+        <BaseSwitch
+          v-model="localSyncEnabled"
+          class="reference-local-sync-switch"
+          :disabled="localImportPending || localSyncPending"
+          :aria-label="t('knowledge.localReference.syncEnabled')"
+        />
+      </div>
+
       <ReferenceExternalImportUnityWindowPane
         v-if="activeSource === 'unity'"
         :model="unityWindowModel"
@@ -1661,6 +1856,96 @@ onUnmounted(() => {
         @close="emit('close')"
         @start="void startUnityImport()"
       />
+
+      <section v-else-if="activeSource === 'local_folder'" class="reference-external-card reference-local-panel">
+        <div class="reference-section-header">
+          <div>
+            <div class="reference-section-title">{{ t("knowledge.localReference.title") }}</div>
+            <div class="reference-section-hint">{{ t("knowledge.localReference.subtitle") }}</div>
+          </div>
+          <div class="reference-section-actions">
+            <BaseButton
+              v-if="localImportPending || localSyncPending"
+              variant="danger"
+              size="sm"
+              :disabled="localCancelPending"
+              @click="void cancelLocalImport()"
+            >
+              {{ localCancelPending ? t("knowledge.referenceImport.window.cancelling") : t("common.cancel") }}
+            </BaseButton>
+            <BaseButton
+              v-if="localCanSync"
+              size="sm"
+              :disabled="localSyncPending || localImportPending"
+              @click="void syncLocalImport()"
+            >
+              {{ localSyncPending ? t("knowledge.localReference.syncing") : t("knowledge.localReference.sync") }}
+            </BaseButton>
+            <BaseButton
+              variant="primary"
+              size="sm"
+              :disabled="!localCanImport || disableSourceSwitch"
+              @click="void startLocalImport()"
+            >
+              {{ localImportPending ? t("knowledge.localReference.importing") : t("knowledge.localReference.import") }}
+            </BaseButton>
+          </div>
+        </div>
+
+        <div class="reference-settings-grid">
+          <div class="reference-field-stack reference-local-source-field">
+            <span class="reference-external-label">{{ t("knowledge.localReference.sourcePath") }}</span>
+            <div class="reference-path-picker">
+              <input
+                v-model="localSourcePath"
+                class="reference-input"
+                :disabled="localImportPending || localSyncPending"
+                :placeholder="t('knowledge.localReference.sourcePlaceholder')"
+              />
+              <BaseButton size="sm" :disabled="localImportPending || localSyncPending" @click="void chooseLocalReferenceSource(false)">
+                {{ t("knowledge.localReference.chooseFile") }}
+              </BaseButton>
+              <BaseButton size="sm" :disabled="localImportPending || localSyncPending" @click="void chooseLocalReferenceSource(true)">
+                {{ t("knowledge.localReference.chooseFolder") }}
+              </BaseButton>
+            </div>
+          </div>
+        </div>
+
+        <div class="reference-status-card">
+          <div class="reference-status-header">
+            <span class="reference-status-title">{{ t("knowledge.localReference.snapshot") }}</span>
+            <span class="reference-status-value">{{ localStatus?.state ?? "missing" }}</span>
+          </div>
+          <div class="reference-status-message">{{ localSummaryMessage }}</div>
+          <div class="reference-meta-grid compact">
+            <div class="reference-meta-row">
+              <span>{{ t("knowledge.referenceImport.managedPath") }}</span>
+              <span class="reference-mono">{{ localTargetPathLabel }}</span>
+            </div>
+            <div class="reference-meta-row">
+              <span>{{ t("knowledge.localReference.sourcePath") }}</span>
+              <span class="reference-mono">{{ localStatus?.sourcePath || localSourcePath || "—" }}</span>
+            </div>
+            <div class="reference-meta-row">
+              <span>{{ t("knowledge.overview.documentsUnit") }}</span>
+              <span>{{ localStatus?.importedDocCount ?? localReport?.importedCount ?? 0 }}</span>
+            </div>
+            <div class="reference-meta-row">
+              <span>{{ t("knowledge.referenceImport.importedAt") }}</span>
+              <span>{{ localImportedAtLabel }}</span>
+            </div>
+            <div class="reference-meta-row">
+              <span>{{ t("knowledge.localReference.skipped") }}</span>
+              <span>{{ localReport?.skippedCount ?? 0 }}</span>
+            </div>
+            <div class="reference-meta-row">
+              <span>{{ t("knowledge.localReference.removed") }}</span>
+              <span>{{ localReport?.removedCount ?? 0 }}</span>
+            </div>
+          </div>
+        </div>
+      </section>
 
       <ReferenceExternalImportFeishuWindowFlow
         v-else
@@ -1726,7 +2011,7 @@ onUnmounted(() => {
         <div class="reference-external-target-card">
           <span class="reference-external-label">{{ t("knowledge.referenceFolder.external.targetPath") }}</span>
           <span class="reference-external-target-path">
-            {{ activeSource === "unity" ? unityTargetPathLabel : feishuTargetPathLabel }}
+            {{ activeSource === "unity" ? unityTargetPathLabel : activeSource === "local_folder" ? localTargetPathLabel : feishuTargetPathLabel }}
           </span>
           <span
             v-if="activeSource === 'unity' && unityExistingPath && unityExistingPath === unityTargetPath"
@@ -1738,7 +2023,114 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section v-if="activeSource === 'unity'" class="reference-external-card">
+    <div v-if="activeSource === 'local_folder'" class="reference-local-sync-config">
+      <div class="reference-local-sync-copy">
+        <div class="reference-local-sync-label">
+          {{ t("knowledge.localReference.syncEnabled") }}
+        </div>
+        <div class="reference-local-sync-hint">
+          {{ t("knowledge.localReference.syncEnabledHint") }}
+        </div>
+      </div>
+      <BaseSwitch
+        v-model="localSyncEnabled"
+        class="reference-local-sync-switch"
+        :disabled="localImportPending || localSyncPending"
+        :aria-label="t('knowledge.localReference.syncEnabled')"
+      />
+    </div>
+
+    <section v-if="activeSource === 'local_folder'" class="reference-external-card reference-local-panel">
+      <div class="reference-section-header">
+        <div>
+          <div class="reference-section-title">{{ t("knowledge.localReference.title") }}</div>
+          <div class="reference-section-hint">{{ t("knowledge.localReference.subtitle") }}</div>
+        </div>
+        <div class="reference-section-actions">
+          <BaseButton
+            v-if="localImportPending || localSyncPending"
+            variant="danger"
+            size="sm"
+            :disabled="localCancelPending"
+            @click="void cancelLocalImport()"
+          >
+            {{ localCancelPending ? t("knowledge.referenceImport.window.cancelling") : t("common.cancel") }}
+          </BaseButton>
+          <BaseButton
+            v-if="localCanSync"
+            size="sm"
+            :disabled="localSyncPending || localImportPending"
+            @click="void syncLocalImport()"
+          >
+            {{ localSyncPending ? t("knowledge.localReference.syncing") : t("knowledge.localReference.sync") }}
+          </BaseButton>
+          <BaseButton
+            variant="primary"
+            size="sm"
+            :disabled="!localCanImport || disableSourceSwitch"
+            @click="void startLocalImport()"
+          >
+            {{ localImportPending ? t("knowledge.localReference.importing") : t("knowledge.localReference.import") }}
+          </BaseButton>
+        </div>
+      </div>
+
+      <div class="reference-settings-grid">
+        <div class="reference-field-stack reference-local-source-field">
+          <span class="reference-external-label">{{ t("knowledge.localReference.sourcePath") }}</span>
+          <div class="reference-path-picker">
+            <input
+              v-model="localSourcePath"
+              class="reference-input"
+              :disabled="localImportPending || localSyncPending"
+              :placeholder="t('knowledge.localReference.sourcePlaceholder')"
+            />
+            <BaseButton size="sm" :disabled="localImportPending || localSyncPending" @click="void chooseLocalReferenceSource(false)">
+              {{ t("knowledge.localReference.chooseFile") }}
+            </BaseButton>
+            <BaseButton size="sm" :disabled="localImportPending || localSyncPending" @click="void chooseLocalReferenceSource(true)">
+              {{ t("knowledge.localReference.chooseFolder") }}
+            </BaseButton>
+          </div>
+        </div>
+      </div>
+
+      <div class="reference-status-card">
+        <div class="reference-status-header">
+          <span class="reference-status-title">{{ t("knowledge.localReference.snapshot") }}</span>
+          <span class="reference-status-value">{{ localStatus?.state ?? "missing" }}</span>
+        </div>
+        <div class="reference-status-message">{{ localSummaryMessage }}</div>
+        <div class="reference-meta-grid compact">
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.referenceImport.managedPath") }}</span>
+            <span class="reference-mono">{{ localTargetPathLabel }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.localReference.sourcePath") }}</span>
+            <span class="reference-mono">{{ localStatus?.sourcePath || localSourcePath || "—" }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.overview.documentsUnit") }}</span>
+            <span>{{ localStatus?.importedDocCount ?? localReport?.importedCount ?? 0 }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.referenceImport.importedAt") }}</span>
+            <span>{{ localImportedAtLabel }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.localReference.skipped") }}</span>
+            <span>{{ localReport?.skippedCount ?? 0 }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.localReference.removed") }}</span>
+            <span>{{ localReport?.removedCount ?? 0 }}</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section v-else-if="activeSource === 'unity'" class="reference-external-card">
       <div class="reference-section-header">
         <div>
           <div class="reference-section-title">{{ t("knowledge.referenceImport.title") }}</div>
@@ -2687,6 +3079,47 @@ onUnmounted(() => {
   grid-column: 1 / -1;
 }
 
+.reference-path-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.reference-local-source-field {
+  grid-column: 1 / -1;
+}
+
+.reference-local-sync-config {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.reference-local-sync-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.reference-local-sync-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.reference-local-sync-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.reference-local-sync-switch {
+  flex-shrink: 0;
+}
+
 .reference-input {
   width: 100%;
   min-height: 34px;
@@ -2835,6 +3268,10 @@ onUnmounted(() => {
   }
 
   .reference-meta-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .reference-path-picker {
     grid-template-columns: minmax(0, 1fr);
   }
 }

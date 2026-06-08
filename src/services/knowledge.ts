@@ -33,6 +33,9 @@ import type {
   FeishuReferenceNodeSummary,
   FeishuReferenceOauthStartResult,
   FeishuSourceTestResult,
+  LocalReferenceImportReport,
+  LocalReferenceImportRequest,
+  LocalReferenceImportStatus,
   LexicalRebuildStatus,
   SkillCreateInput,
   UnityReferenceImportLocale,
@@ -562,6 +565,28 @@ export function knowledgeCancelFeishuReferenceImport(
   );
 }
 
+export function knowledgeGetLocalReferenceImportStatus(
+  targetPath?: string | null,
+): Promise<LocalReferenceImportStatus> {
+  return ipcInvoke<LocalReferenceImportStatus>(
+    "knowledge_get_local_reference_import_status",
+    {
+      targetPath: targetPath ?? null,
+    },
+  );
+}
+
+export function knowledgeCancelLocalReferenceImport(
+  targetPath?: string | null,
+): Promise<LocalReferenceImportStatus> {
+  return ipcInvoke<LocalReferenceImportStatus>(
+    "knowledge_cancel_local_reference_import",
+    {
+      targetPath: targetPath ?? null,
+    },
+  );
+}
+
 export function knowledgeImportUnityReferenceDocs(
   targetPath?: string | null,
   locale?: UnityReferenceImportLocale,
@@ -572,6 +597,24 @@ export function knowledgeImportUnityReferenceDocs(
       targetPath: targetPath ?? null,
       locale,
     },
+  );
+}
+
+export function knowledgeImportLocalReferenceSource(
+  request: LocalReferenceImportRequest,
+): Promise<LocalReferenceImportReport> {
+  return ipcInvoke<LocalReferenceImportReport>(
+    "knowledge_import_local_reference_source",
+    { request },
+  );
+}
+
+export function knowledgeSyncLocalReferenceSource(
+  targetPath: string,
+): Promise<LocalReferenceImportReport> {
+  return ipcInvoke<LocalReferenceImportReport>(
+    "knowledge_sync_local_reference_source",
+    { targetPath },
   );
 }
 

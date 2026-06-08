@@ -39,7 +39,12 @@ function applyPayload(nextPayload: ReferenceExternalImportWindowPayload) {
   payload.value = {
     parentDir: normalizeRelativePath(nextPayload.parentDir),
     fixedTargetPath: normalizeRelativePath(nextPayload.fixedTargetPath),
-    initialSource: nextPayload.initialSource === "unity" ? "unity" : "feishu",
+    initialSource:
+      nextPayload.initialSource === "feishu" ||
+      nextPayload.initialSource === "unity" ||
+      nextPayload.initialSource === "local_folder"
+        ? nextPayload.initialSource
+        : "local_folder",
   };
   panelKey.value += 1;
 }
@@ -151,7 +156,7 @@ onUnmounted(() => {
           mode="window"
           :parent-dir="payload.parentDir || ''"
           :fixed-target-path="payload.fixedTargetPath || null"
-          :initial-source="payload.initialSource || 'feishu'"
+          :initial-source="payload.initialSource || 'local_folder'"
           @close="void requestWindowClose()"
           @running-change="panelRunning = $event"
         />

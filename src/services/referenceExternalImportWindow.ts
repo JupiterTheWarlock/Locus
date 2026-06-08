@@ -1,6 +1,6 @@
 import { getCurrentWebviewWindow, WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
-export type ReferenceExternalImportSource = "feishu" | "unity";
+export type ReferenceExternalImportSource = "feishu" | "unity" | "local_folder";
 
 export const REFERENCE_EXTERNAL_IMPORT_WINDOW_LABEL = "reference-external-import";
 export const REFERENCE_EXTERNAL_IMPORT_WINDOW_PATH = "/reference-external-import";
@@ -33,7 +33,7 @@ export function getReferenceExternalImportWindowPayload(
   return {
     parentDir: trimOrEmpty(params.get("parentDir")),
     fixedTargetPath: trimOrEmpty(params.get("fixedTargetPath")),
-    initialSource: initialSource === "unity" || initialSource === "feishu"
+    initialSource: initialSource === "unity" || initialSource === "feishu" || initialSource === "local_folder"
       ? initialSource
       : null,
   };
@@ -51,7 +51,11 @@ export function buildReferenceExternalImportWindowUrl(
   if (trimOrEmpty(payload.fixedTargetPath)) {
     params.set("fixedTargetPath", trimOrEmpty(payload.fixedTargetPath));
   }
-  if (payload.initialSource === "feishu" || payload.initialSource === "unity") {
+  if (
+    payload.initialSource === "feishu"
+    || payload.initialSource === "unity"
+    || payload.initialSource === "local_folder"
+  ) {
     params.set("initialSource", payload.initialSource);
   }
   return `${REFERENCE_EXTERNAL_IMPORT_WINDOW_PATH}?${params.toString()}`;

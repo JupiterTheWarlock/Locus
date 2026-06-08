@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const webviewWindowMocks = vi.hoisted(() => ({
   getByLabelMock: vi.fn(),
@@ -43,10 +45,21 @@ describe("referenceExternalImportWindow", () => {
     );
     expect(buildReferenceExternalImportWindowUrl({
       parentDir: "reference/gameplay",
-      initialSource: "unity",
+      initialSource: "local_folder",
     })).toBe(
-      "/reference-external-import?referenceExternalImport=1&parentDir=reference%2Fgameplay&initialSource=unity",
+      "/reference-external-import?referenceExternalImport=1&parentDir=reference%2Fgameplay&initialSource=local_folder",
     );
+  });
+
+  it("defaults the standalone window to the leftmost local files source", () => {
+    const windowView = readFileSync(
+      resolve(process.cwd(), "src/components/ReferenceExternalImportWindow.vue"),
+      "utf8",
+    );
+
+    expect(windowView).toContain(':initial-source="payload.initialSource || \'local_folder\'"');
+    expect(windowView).toContain(': "local_folder"');
+    expect(windowView).not.toContain(':initial-source="payload.initialSource || \'feishu\'"');
   });
 
   it("focuses an existing window and updates its payload", async () => {

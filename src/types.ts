@@ -1075,6 +1075,41 @@ export interface KnowledgeExternalDirectoryBinding {
   externalSources: KnowledgeExternalSource[];
 }
 
+export interface LocalReferenceSkippedFile {
+  path: string;
+  reason: string;
+}
+
+export interface LocalReferenceImportRequest {
+  sourcePath: string;
+  targetPath: string;
+  syncEnabled?: boolean;
+}
+
+export interface LocalReferenceImportReport {
+  targetPath: string;
+  sourcePath: string;
+  importedCount: number;
+  skippedCount: number;
+  removedCount: number;
+  skipped: LocalReferenceSkippedFile[];
+}
+
+export type LocalReferenceImportState = "missing" | "ready" | "source_missing" | "error";
+
+export interface LocalReferenceImportStatus {
+  state: LocalReferenceImportState;
+  running: boolean;
+  targetPath: string;
+  sourcePath: string;
+  sourceLocator: string;
+  syncEnabled: boolean;
+  importedAt?: number | null;
+  importedDocCount: number;
+  message: string;
+  error?: string | null;
+}
+
 export type KnowledgeSearchMatchKind =
   | "lexical"
   | "semantic"

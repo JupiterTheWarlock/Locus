@@ -27,6 +27,9 @@ use crate::knowledge_store::{
     KnowledgeReadResponse, KnowledgeSearchHit, KnowledgeSourceProvider, KnowledgeTargetKind,
     KnowledgeType, KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
 };
+use crate::local_reference::{
+    self, LocalReferenceImportReport, LocalReferenceImportRequest, LocalReferenceImportStatus,
+};
 use crate::tool::ToolRegistry;
 use crate::unity_docs::{
     self, UnityManagedDirectoryStat, UnityReferenceImportState, UnityReferenceImportStatus,
@@ -1795,6 +1798,26 @@ pub async fn knowledge_cancel_feishu_reference_import(
 }
 
 #[tauri::command]
+pub async fn knowledge_get_local_reference_import_status(
+    target_path: Option<String>,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<LocalReferenceImportStatus, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    local_reference::get_local_reference_import_status(&working_dir, target_path.as_deref())
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn knowledge_cancel_local_reference_import(
+    target_path: Option<String>,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<LocalReferenceImportStatus, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    local_reference::cancel_local_reference_import(&working_dir, target_path.as_deref())
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn knowledge_read(
     request: KnowledgeReadRequest,
     workspace: State<'_, Arc<Workspace>>,
@@ -1845,6 +1868,46 @@ pub async fn knowledge_import_feishu_reference_docs(
     )
     .await
     .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn knowledge_import_local_reference_source(
+    request: LocalReferenceImportRequest,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+) -> Result<LocalReferenceImportReport, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let report = local_reference::import_local_reference_snapshot(&working_dir, request)
+        .map_err(AppError::from)?;
+    reconcile_and_emit_knowledge_changed(
+        &app_handle,
+        &working_dir,
+        knowledge_index_state.inner().clone(),
+        "knowledge_import_local_reference_source",
+    )
+    .await?;
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn knowledge_sync_local_reference_source(
+    target_path: String,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+) -> Result<LocalReferenceImportReport, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let report = local_reference::sync_local_reference_snapshot(&working_dir, &target_path)
+        .map_err(AppError::from)?;
+    reconcile_and_emit_knowledge_changed(
+        &app_handle,
+        &working_dir,
+        knowledge_index_state.inner().clone(),
+        "knowledge_sync_local_reference_source",
+    )
+    .await?;
+    Ok(report)
 }
 
 #[tauri::command]

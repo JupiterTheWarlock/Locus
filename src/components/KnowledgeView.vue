@@ -25,8 +25,6 @@ import {
   type ReferenceExternalImportSource,
 } from "../services/referenceExternalImportWindow";
 
-const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
-
 const props = defineProps<{
   workingDir: string;
   selectedModelId: string;
@@ -298,14 +296,6 @@ function normalizeRelativePath(path: string): string {
     .replace(/^\/+|\/+$/g, "");
 }
 
-function isUnityReferenceDocumentPath(path: string): boolean {
-  const normalizedPath = normalizeRelativePath(path);
-  return (
-    normalizedPath === UNITY_REFERENCE_MANAGED_DIR ||
-    normalizedPath.startsWith(`${UNITY_REFERENCE_MANAGED_DIR}/`)
-  );
-}
-
 function referenceFolderExists(
   path: string,
   nodes: ExplorerNode[] = visibleExplorerTree.value,
@@ -320,26 +310,15 @@ function referenceFolderExists(
   return false;
 }
 
-const hasUnityReferenceDocs = computed(
-  () =>
-    documents.value.some(
-      (doc) =>
-        doc.type === "reference" && isUnityReferenceDocumentPath(doc.path),
-    ) || referenceFolderExists(UNITY_REFERENCE_MANAGED_DIR),
-);
-
 function openExternalImportWindow(
   parentDir = "",
   initialSource: ReferenceExternalImportSource | null = null,
 ) {
   if (activeType.value !== "reference") return;
   const normalizedParent = normalizeRelativePath(parentDir);
-  const preferredSource =
-    initialSource ??
-    (!normalizedParent && !hasUnityReferenceDocs.value ? "unity" : null);
   void openReferenceExternalImportWindow({
     parentDir: normalizedParent,
-    initialSource: preferredSource,
+    initialSource: initialSource ?? "local_folder",
   });
 }
 
