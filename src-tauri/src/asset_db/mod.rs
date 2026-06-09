@@ -416,6 +416,19 @@ impl AssetDb {
                 .to_string_lossy()
                 .to_lowercase();
             let asset_exists = self.project_root.join(&asset_path).exists();
+            let (mtime_ns, size) = self
+                .project_root
+                .join(&asset_path)
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| {
+                    (
+                        entry.mtime_ns.max(scanner::get_mtime_ns(&metadata)),
+                        metadata.len(),
+                    )
+                })
+                .unwrap_or((entry.mtime_ns, entry.size));
 
             let initial_kind = match ext.as_str() {
                 "cs" => AssetKind::Script,
@@ -433,8 +446,8 @@ impl AssetDb {
                 ext,
                 kind: initial_kind,
                 exists_on_disk: asset_exists,
-                mtime_ns: entry.mtime_ns,
-                size: entry.size,
+                mtime_ns,
+                size,
                 content_hash: [0u8; 16],
                 meta_hash: *meta_hash,
                 parser_version: 1,
@@ -622,7 +635,7 @@ impl AssetDb {
                 let node = &mut asset_nodes[idx];
                 node.kind = AssetKind::from_ext(&entry.ext);
                 node.content_hash = content_hash;
-                node.mtime_ns = entry.mtime_ns;
+                node.mtime_ns = node.mtime_ns.max(entry.mtime_ns);
                 node.size = entry.size;
                 if node.kind == AssetKind::GenericAsset {
                     if let Some(script_guid) = main_script_guid {

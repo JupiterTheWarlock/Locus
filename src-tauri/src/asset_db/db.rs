@@ -10,9 +10,9 @@ use super::types::*;
 const CURRENT_PARSER_VERSION: u32 = 1;
 
 /// Schema version. Bump on any incompatible asset-table schema change. Mismatch
-/// at `open_db` time triggers a full DB delete + rebuild — `locus.db` is a
+/// at `open_db` time triggers a full DB delete + rebuild -- `locus.db` is a
 /// pure cache and we never migrate it.
-pub const ASSET_DB_VERSION: u32 = 9;
+pub const ASSET_DB_VERSION: u32 = 10;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")

@@ -2699,6 +2699,64 @@ mod tests {
     }
 
     #[test]
+    fn mtime_scan_once_does_not_requeue_binary_asset_after_full_scan() {
+        let root =
+            std::env::temp_dir().join(format!("locus-watcher-binary-converge-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets/Textures")).expect("create temp assets");
+
+        write_asset(
+            &root,
+            "Assets/Textures/sample.png",
+            b"tiny-png-placeholder",
+            "11111111111111111111111111111111",
+        );
+
+        let graph = scan_test_graph(&root);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let activity = RecentQueueActivityLog::new();
+
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
+
+        assert_eq!(queue.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mtime_scan_once_does_not_requeue_yaml_asset_with_newer_meta_after_full_scan() {
+        let root =
+            std::env::temp_dir().join(format!("locus-watcher-yaml-converge-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets/Prefabs")).expect("create temp assets");
+
+        let asset_path = root.join("Assets/Prefabs/sample.prefab");
+        std::fs::write(
+            &asset_path,
+            b"%YAML 1.1\n--- !u!1 &1\nGameObject:\n  m_Name: Root\n",
+        )
+        .expect("write yaml asset");
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            root.join("Assets/Prefabs/sample.prefab.meta"),
+            b"fileFormatVersion: 2\nguid: 22222222222222222222222222222222\n",
+        )
+        .expect("write newer meta");
+
+        let graph = scan_test_graph(&root);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let activity = RecentQueueActivityLog::new();
+
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
+
+        assert_eq!(queue.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn mtime_resync_converges_after_same_path_guid_replacement() {
         let root =
             std::env::temp_dir().join(format!("locus-watcher-stale-guid-{}", Uuid::new_v4()));
