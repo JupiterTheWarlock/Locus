@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -50,6 +50,13 @@ const RECENT_ENQUEUE_RETENTION_MS: u64 = 5 * 60_000;
 const RECENT_ENQUEUE_SAMPLE_LIMIT: usize = 8;
 const RECENT_ENQUEUE_BUFFER_LIMIT: usize = 512;
 const QUEUE_SUMMARY_LOG_INTERVAL_SECS: u64 = 3;
+const STAGE_WATCHDOG_TICK_MS: u64 = 1_000;
+const STAGE_WATCHDOG_FIRST_WARN_MS: u64 = 10_000;
+const STAGE_WATCHDOG_SECOND_WARN_MS: u64 = 30_000;
+const STAGE_WATCHDOG_STEADY_WARN_MS: u64 = 60_000;
+const SLOW_STAGE_LOG_MS: u128 = 1_000;
+const REPEAT_PROCESS_WINDOW_MS: u64 = 60_000;
+const REPEAT_PROCESS_LOG_THRESHOLD: usize = 3;
 const RECONCILE_PROGRESS_TARGET_EVENTS: u64 = 96;
 const RECONCILE_PROGRESS_MIN_STEP: u64 = 32;
 
@@ -314,6 +321,278 @@ impl Default for RecentQueueActivityLog {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone)]
+struct WorkerStageSnapshot {
+    worker_index: usize,
+    current_path: Option<String>,
+    current_stage: &'static str,
+    stage_start: Instant,
+    item_start: Instant,
+    last_completed_stage: Option<&'static str>,
+    last_error: Option<String>,
+    next_warn_after: Duration,
+    active: bool,
+}
+
+impl WorkerStageSnapshot {
+    fn idle(worker_index: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            worker_index,
+            current_path: None,
+            current_stage: "idle",
+            stage_start: now,
+            item_start: now,
+            last_completed_stage: None,
+            last_error: None,
+            next_warn_after: Duration::from_millis(STAGE_WATCHDOG_FIRST_WARN_MS),
+            active: false,
+        }
+    }
+}
+
+type WorkerDiagnostics = Arc<Vec<Mutex<WorkerStageSnapshot>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathDiskSignature {
+    asset_mtime_ns: u64,
+    asset_size: u64,
+    meta_mtime_ns: u64,
+    meta_size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RepeatProcessEvent {
+    at_unix_ms: u64,
+    signature: PathDiskSignature,
+}
+
+#[derive(Default)]
+struct RepeatProcessDiagnostics {
+    inner: Mutex<HashMap<String, VecDeque<RepeatProcessEvent>>>,
+}
+
+type SharedRepeatProcessDiagnostics = Arc<RepeatProcessDiagnostics>;
+
+fn new_worker_diagnostics() -> WorkerDiagnostics {
+    Arc::new(
+        (0..MAX_WORKER_THREADS)
+            .map(|index| Mutex::new(WorkerStageSnapshot::idle(index)))
+            .collect(),
+    )
+}
+
+fn path_disk_signature(project_root: &Path, rel_path: &str) -> PathDiskSignature {
+    let asset_abs = project_root.join(rel_path);
+    let meta_abs = project_root.join(format!("{}.meta", rel_path));
+    let asset_meta = std::fs::metadata(&asset_abs).ok();
+    let meta_meta = std::fs::metadata(&meta_abs).ok();
+    PathDiskSignature {
+        asset_mtime_ns: asset_meta.as_ref().map(scanner::get_mtime_ns).unwrap_or(0),
+        asset_size: asset_meta.map(|m| m.len()).unwrap_or(0),
+        meta_mtime_ns: meta_meta.as_ref().map(scanner::get_mtime_ns).unwrap_or(0),
+        meta_size: meta_meta.map(|m| m.len()).unwrap_or(0),
+    }
+}
+
+fn record_processed_path(
+    diagnostics: &RepeatProcessDiagnostics,
+    project_root: &Path,
+    rel_path: &str,
+    cascade_count: usize,
+) {
+    let now = unix_time_ms();
+    let cutoff = now.saturating_sub(REPEAT_PROCESS_WINDOW_MS);
+    let signature = path_disk_signature(project_root, rel_path);
+    let mut should_log = false;
+    let mut count = 0usize;
+    let mut signature_changed = false;
+
+    if let Ok(mut inner) = diagnostics.inner.lock() {
+        let events = inner.entry(rel_path.to_string()).or_default();
+        while events
+            .front()
+            .map(|entry| entry.at_unix_ms < cutoff)
+            .unwrap_or(false)
+        {
+            events.pop_front();
+        }
+        signature_changed = events
+            .back()
+            .map(|entry| entry.signature != signature)
+            .unwrap_or(false);
+        events.push_back(RepeatProcessEvent {
+            at_unix_ms: now,
+            signature: signature.clone(),
+        });
+        count = events.len();
+        should_log = count >= REPEAT_PROCESS_LOG_THRESHOLD;
+    }
+
+    if should_log {
+        eprintln!(
+            "[AssetDb Watcher Diag] repeated processed path: path={}, count={} in {}s, signature_changed={}, cascade_paths={}, asset_mtime_ns={}, asset_size={}, meta_mtime_ns={}, meta_size={}",
+            rel_path,
+            count,
+            REPEAT_PROCESS_WINDOW_MS / 1000,
+            signature_changed,
+            cascade_count,
+            signature.asset_mtime_ns,
+            signature.asset_size,
+            signature.meta_mtime_ns,
+            signature.meta_size
+        );
+    }
+}
+
+fn begin_worker_item(diagnostics: &WorkerDiagnostics, index: usize, path: &str) {
+    if let Some(slot) = diagnostics.get(index) {
+        if let Ok(mut snapshot) = slot.lock() {
+            let now = Instant::now();
+            snapshot.current_path = Some(path.to_string());
+            snapshot.current_stage = "dequeued";
+            snapshot.stage_start = now;
+            snapshot.item_start = now;
+            snapshot.last_completed_stage = None;
+            snapshot.last_error = None;
+            snapshot.next_warn_after = Duration::from_millis(STAGE_WATCHDOG_FIRST_WARN_MS);
+            snapshot.active = true;
+        }
+    }
+}
+
+fn set_worker_stage(diagnostics: &WorkerDiagnostics, index: usize, stage: &'static str) {
+    let mut completed: Option<(String, &'static str, u128)> = None;
+    if let Some(slot) = diagnostics.get(index) {
+        if let Ok(mut snapshot) = slot.lock() {
+            let now = Instant::now();
+            let elapsed_ms = now.duration_since(snapshot.stage_start).as_millis();
+            if snapshot.active && snapshot.current_stage != "idle" && elapsed_ms >= SLOW_STAGE_LOG_MS
+            {
+                completed = Some((
+                    snapshot.current_path.clone().unwrap_or_else(|| "-".to_string()),
+                    snapshot.current_stage,
+                    elapsed_ms,
+                ));
+            }
+            snapshot.last_completed_stage = Some(snapshot.current_stage);
+            snapshot.current_stage = stage;
+            snapshot.stage_start = now;
+            snapshot.next_warn_after = Duration::from_millis(STAGE_WATCHDOG_FIRST_WARN_MS);
+        }
+    }
+
+    if let Some((path, completed_stage, elapsed_ms)) = completed {
+        eprintln!(
+            "[AssetDb Watcher Diag] worker {} completed slow stage: path={}, stage={}, elapsed_ms={}",
+            index, path, completed_stage, elapsed_ms
+        );
+    }
+}
+
+fn finish_worker_item(diagnostics: &WorkerDiagnostics, index: usize, error: Option<String>) {
+    let mut completed: Option<(String, &'static str, u128, u128)> = None;
+    if let Some(slot) = diagnostics.get(index) {
+        if let Ok(mut snapshot) = slot.lock() {
+            let now = Instant::now();
+            let stage_elapsed_ms = now.duration_since(snapshot.stage_start).as_millis();
+            let item_elapsed_ms = now.duration_since(snapshot.item_start).as_millis();
+            if snapshot.active && snapshot.current_stage != "idle" {
+                completed = Some((
+                    snapshot.current_path.clone().unwrap_or_else(|| "-".to_string()),
+                    snapshot.current_stage,
+                    stage_elapsed_ms,
+                    item_elapsed_ms,
+                ));
+            }
+            snapshot.last_completed_stage = Some(snapshot.current_stage);
+            snapshot.last_error = error;
+            snapshot.current_path = None;
+            snapshot.current_stage = "idle";
+            snapshot.stage_start = now;
+            snapshot.item_start = now;
+            snapshot.next_warn_after = Duration::from_millis(STAGE_WATCHDOG_FIRST_WARN_MS);
+            snapshot.active = false;
+        }
+    }
+
+    if let Some((path, completed_stage, stage_elapsed_ms, item_elapsed_ms)) = completed {
+        if stage_elapsed_ms >= SLOW_STAGE_LOG_MS || item_elapsed_ms >= SLOW_STAGE_LOG_MS {
+            eprintln!(
+                "[AssetDb Watcher Diag] worker {} completed item: path={}, last_stage={}, stage_elapsed_ms={}, item_elapsed_ms={}",
+                index, path, completed_stage, stage_elapsed_ms, item_elapsed_ms
+            );
+        }
+    }
+}
+
+fn set_process_stage(
+    diagnostics: Option<&WorkerDiagnostics>,
+    worker_index: Option<usize>,
+    stage: &'static str,
+) {
+    if let (Some(diagnostics), Some(worker_index)) = (diagnostics, worker_index) {
+        set_worker_stage(diagnostics, worker_index, stage);
+    }
+}
+
+fn stage_watchdog_loop(
+    diagnostics: WorkerDiagnostics,
+    queue: Arc<DirtyQueue>,
+    activity: Arc<RecentQueueActivityLog>,
+    stop: Arc<AtomicBool>,
+) {
+    eprintln!("[AssetDb Watcher Diag] stage watchdog started");
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(STAGE_WATCHDOG_TICK_MS));
+        let pending = queue.len();
+        let recent = activity.snapshot(RECENT_ENQUEUE_WINDOW_MS, RECENT_ENQUEUE_SAMPLE_LIMIT);
+        let mut active_count = 0usize;
+
+        for slot in diagnostics.iter() {
+            let mut warning: Option<WorkerStageSnapshot> = None;
+            if let Ok(mut snapshot) = slot.lock() {
+                if !snapshot.active {
+                    continue;
+                }
+                active_count += 1;
+                let elapsed = snapshot.stage_start.elapsed();
+                if elapsed >= snapshot.next_warn_after {
+                    warning = Some(snapshot.clone());
+                    let elapsed_ms = elapsed.as_millis() as u64;
+                    let next_ms = if elapsed_ms < STAGE_WATCHDOG_SECOND_WARN_MS {
+                        STAGE_WATCHDOG_SECOND_WARN_MS
+                    } else {
+                        elapsed_ms.saturating_add(STAGE_WATCHDOG_STEADY_WARN_MS)
+                    };
+                    snapshot.next_warn_after = Duration::from_millis(next_ms);
+                }
+            }
+
+            if let Some(snapshot) = warning {
+                let stage_elapsed_ms = snapshot.stage_start.elapsed().as_millis();
+                let item_elapsed_ms = snapshot.item_start.elapsed().as_millis();
+                let path = snapshot.current_path.as_deref().unwrap_or("-");
+                eprintln!(
+                    "[AssetDb Watcher Diag] stage watchdog: worker={}, path={}, stage={}, stage_elapsed_ms={}, item_elapsed_ms={}, pending={}, active_workers={}, recent={} in {}s, last_completed={}, last_error={}",
+                    snapshot.worker_index,
+                    path,
+                    snapshot.current_stage,
+                    stage_elapsed_ms,
+                    item_elapsed_ms,
+                    pending,
+                    active_count,
+                    recent.total_added,
+                    recent.window_ms / 1000,
+                    snapshot.last_completed_stage.unwrap_or("-"),
+                    snapshot.last_error.as_deref().unwrap_or("-")
+                );
+            }
+        }
+    }
+    eprintln!("[AssetDb Watcher Diag] stage watchdog stopped");
 }
 
 fn unix_time_ms() -> u64 {
@@ -880,6 +1159,8 @@ fn sleep_interruptible(duration: Duration, stop: &AtomicBool) -> bool {
 fn resolve_guid_paths_for_content(
     content: &[u8],
     graph_state: &Arc<Mutex<Option<AssetDb>>>,
+    diagnostics: Option<&WorkerDiagnostics>,
+    worker_index: Option<usize>,
 ) -> Result<HashMap<Guid, String>, String> {
     let text = String::from_utf8_lossy(content);
     let lines: Vec<&str> = text.lines().collect();
@@ -888,9 +1169,11 @@ fn resolve_guid_paths_for_content(
         return Ok(HashMap::new());
     }
 
+    set_process_stage(diagnostics, worker_index, "wait for graph_state mutex resolving refs");
     let guard = graph_state
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
+    set_process_stage(diagnostics, worker_index, "resolve referenced guid paths");
     match guard.as_ref() {
         Some(graph) => db::batch_resolve_paths(&graph.conn, &guids),
         None => Ok(HashMap::new()),
@@ -902,14 +1185,19 @@ fn process_dirty_asset(
     project_root: &Path,
     graph_state: &Arc<Mutex<Option<AssetDb>>>,
     stop: &AtomicBool,
+    diagnostics: Option<&WorkerDiagnostics>,
+    worker_index: Option<usize>,
 ) -> Result<Vec<QueueEnqueueRequest>, String> {
+    set_process_stage(diagnostics, worker_index, "enter process_dirty_asset");
     if stop.load(Ordering::Relaxed) {
         return Ok(Vec::new());
     }
 
+    set_process_stage(diagnostics, worker_index, "resolve asset and meta paths");
     let meta_abs = project_root.join(format!("{}.meta", asset_rel_path));
     let asset_abs = project_root.join(asset_rel_path);
 
+    set_process_stage(diagnostics, worker_index, "check asset existence");
     let meta_exists = meta_abs.is_file();
     let asset_exists = asset_abs.is_file();
 
@@ -917,10 +1205,12 @@ fn process_dirty_asset(
         if stop.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }
+        set_process_stage(diagnostics, worker_index, "wait for graph_state mutex deleting missing asset");
         let mut guard = graph_state
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(ref mut graph) = *guard {
+            set_process_stage(diagnostics, worker_index, "delete missing asset from DB");
             if db::delete_missing_asset_path(&mut graph.conn, asset_rel_path)? {
                 eprintln!(
                     "[AssetDb Watcher] removed deleted asset: {}",
@@ -939,14 +1229,19 @@ fn process_dirty_asset(
     if stop.load(Ordering::Relaxed) {
         return Ok(Vec::new());
     }
+    set_process_stage(diagnostics, worker_index, "read meta file");
     let meta_content = std::fs::read(&meta_abs)
         .map_err(|e| format!("Failed to read {}: {}", meta_abs.display(), e))?;
+    set_process_stage(diagnostics, worker_index, "parse meta guid");
     let guid = meta_parser::extract_guid(&meta_content)
         .ok_or_else(|| format!("No GUID in {}", meta_abs.display()))?;
+    set_process_stage(diagnostics, worker_index, "hash meta content");
     let meta_hash = hash128(&meta_content);
+    set_process_stage(diagnostics, worker_index, "collect meta metadata");
     let meta_mtime = file_mtime_ns(&meta_abs);
     let meta_size = std::fs::metadata(&meta_abs).map(|m| m.len()).unwrap_or(0);
 
+    set_process_stage(diagnostics, worker_index, "classify asset extension");
     let ext = Path::new(asset_rel_path)
         .extension()
         .unwrap_or_default()
@@ -954,10 +1249,12 @@ fn process_dirty_asset(
         .to_lowercase();
 
     let old_script_meta = if ext == "cs" {
+        set_process_stage(diagnostics, worker_index, "wait for graph_state mutex reading old script metadata");
         let guard = graph_state
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(graph) = guard.as_ref() {
+            set_process_stage(diagnostics, worker_index, "read old script metadata");
             db::get_stored_script_metadata(&graph.conn, &guid)?
         } else {
             None
@@ -976,12 +1273,19 @@ fn process_dirty_asset(
     let mut script_type_by_guid: HashMap<Guid, db::StoredScriptMetadata> = HashMap::new();
 
     if asset_exists && is_yaml_asset_ext(&ext) {
+        set_process_stage(diagnostics, worker_index, "read YAML asset file");
         let content = std::fs::read(&asset_abs)
             .map_err(|e| format!("Failed to read {}: {}", asset_abs.display(), e))?;
-        let guid_to_path = resolve_guid_paths_for_content(&content, graph_state)?;
+        set_process_stage(diagnostics, worker_index, "collect YAML referenced guids");
+        let guid_to_path =
+            resolve_guid_paths_for_content(&content, graph_state, diagnostics, worker_index)?;
+        set_process_stage(diagnostics, worker_index, "extract dependency refs");
         let refs = unity_yaml::extract_refs_with_resolver(&content, Some(&guid_to_path));
+        set_process_stage(diagnostics, worker_index, "parse YAML docs");
         let docs = unity_yaml::parse_yaml_docs(&content);
+        set_process_stage(diagnostics, worker_index, "hash YAML content");
         content_hash = hash128(&content);
+        set_process_stage(diagnostics, worker_index, "collect YAML metadata");
         let metadata = std::fs::metadata(&asset_abs).ok();
         asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
         asset_size = metadata.map(|m| m.len()).unwrap_or(0);
@@ -989,10 +1293,12 @@ fn process_dirty_asset(
 
         let script_guids: HashSet<Guid> = docs.iter().filter_map(|doc| doc.m_script_guid).collect();
         if !script_guids.is_empty() {
+            set_process_stage(diagnostics, worker_index, "wait for graph_state mutex reading script type metadata");
             let guard = graph_state
                 .lock()
                 .map_err(|e| format!("Lock error: {}", e))?;
             if let Some(graph) = guard.as_ref() {
+                set_process_stage(diagnostics, worker_index, "read script type metadata");
                 for script_guid in script_guids {
                     if let Some(meta) = db::get_stored_script_metadata(&graph.conn, &script_guid)? {
                         script_type_by_guid.insert(script_guid, meta);
@@ -1015,6 +1321,7 @@ fn process_dirty_asset(
             .collect();
 
         if kind == AssetKind::GenericAsset {
+            set_process_stage(diagnostics, worker_index, "classify generic YAML script type");
             let script_guid = docs
                 .iter()
                 .find(|doc| doc.doc_index == 0 && doc.class_id == 114)
@@ -1030,6 +1337,7 @@ fn process_dirty_asset(
         }
         yaml_docs = Some(docs);
     } else if asset_exists && ext == "cs" {
+        set_process_stage(diagnostics, worker_index, "read and parse script file");
         let snapshot = script_parser::read_script_file_snapshot(&asset_abs)
             .ok_or_else(|| format!("Failed to read script file: {}", asset_abs.display()))?;
         kind = AssetKind::Script;
@@ -1067,10 +1375,12 @@ fn process_dirty_asset(
                 .as_ref()
                 .and_then(|m| m.base_type.as_deref())
             {
+                set_process_stage(diagnostics, worker_index, "wait for graph_state mutex resolving script base type");
                 let guard = graph_state
                     .lock()
                     .map_err(|e| format!("Lock error: {}", e))?;
                 if let Some(graph) = guard.as_ref() {
+                    set_process_stage(diagnostics, worker_index, "resolve script base type");
                     db::get_stored_script_metadata_for_base_type(
                         &graph.conn,
                         base_type,
@@ -1089,6 +1399,7 @@ fn process_dirty_asset(
                 &snapshot,
                 inherited_base_search.as_deref(),
             ) {
+                set_process_stage(diagnostics, worker_index, "build indexed script metadata");
                 stored_script_meta = Some(db::StoredScriptMetadata {
                     class_name: indexed.class_name,
                     class_name_lower: indexed.class_name_lower,
@@ -1100,6 +1411,7 @@ fn process_dirty_asset(
             }
         }
     } else {
+        set_process_stage(diagnostics, worker_index, "classify non-YAML asset kind");
         kind = match ext.as_str() {
             "png" | "jpg" | "jpeg" | "tga" | "psd" | "tif" | "tiff" | "bmp" | "gif" | "exr"
             | "hdr" => AssetKind::Texture,
@@ -1115,12 +1427,14 @@ fn process_dirty_asset(
             }
         };
         if asset_exists {
+            set_process_stage(diagnostics, worker_index, "collect non-YAML metadata");
             let metadata = std::fs::metadata(&asset_abs).ok();
             asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
             asset_size = metadata.map(|m| m.len()).unwrap_or(0);
         }
     }
 
+    set_process_stage(diagnostics, worker_index, "build asset node");
     let node = AssetNode {
         guid,
         path: asset_rel_path.to_string(),
@@ -1159,6 +1473,7 @@ fn process_dirty_asset(
 
     let mut asset_objects: Vec<AssetObject> = Vec::new();
     if let Some(docs) = yaml_docs.as_ref() {
+        set_process_stage(diagnostics, worker_index, "extract sub-asset objects from YAML");
         asset_objects.extend(object_index::build_yaml_asset_objects(
             &node,
             docs,
@@ -1174,8 +1489,10 @@ fn process_dirty_asset(
             },
         ));
     }
+    set_process_stage(diagnostics, worker_index, "extract importer sub-assets from meta");
     let importer_subassets = object_index::parse_importer_subassets(&meta_content);
     if !importer_subassets.is_empty() {
+        set_process_stage(diagnostics, worker_index, "build importer sub-asset objects");
         asset_objects.extend(object_index::build_importer_sub_asset_objects(
             &node,
             &importer_subassets,
@@ -1198,20 +1515,24 @@ fn process_dirty_asset(
         return Ok(Vec::new());
     }
 
+    set_process_stage(diagnostics, worker_index, "wait for graph_state mutex before DB update");
     let mut guard = graph_state
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
     let mut cascade_paths = Vec::new();
     if let Some(ref mut graph) = *guard {
-        db::atomic_update_asset(
+        set_process_stage(diagnostics, worker_index, "atomic update start");
+        db::atomic_update_asset_with_stage(
             &mut graph.conn,
             &node,
             &asset_objects,
             &edges,
             &file_records,
+            |stage| set_process_stage(diagnostics, worker_index, stage),
         )?;
         if ext == "cs" {
             let source_path = Some(asset_rel_path.to_string());
+            set_process_stage(diagnostics, worker_index, "script cascade query phase");
             for path in db::find_asset_paths_referencing_guid(&graph.conn, &guid)? {
                 cascade_paths.push(QueueEnqueueRequest {
                     rel_path: path,
@@ -1232,6 +1553,7 @@ fn process_dirty_asset(
                     class_names.push(new_meta.cascade_lookup_term().to_string());
                 }
             }
+            set_process_stage(diagnostics, worker_index, "script descendant query phase");
             for path in db::find_script_descendant_paths(&graph.conn, &class_names, &guid)? {
                 cascade_paths.push(QueueEnqueueRequest {
                     rel_path: path,
@@ -1242,6 +1564,7 @@ fn process_dirty_asset(
         }
     }
 
+    set_process_stage(diagnostics, worker_index, "exit process_dirty_asset");
     Ok(cascade_paths)
 }
 
@@ -1254,6 +1577,8 @@ fn worker_loop(
     current: CurrentFileSlot,
     tuning: Arc<WatcherTuning>,
     activity: Arc<RecentQueueActivityLog>,
+    diagnostics: WorkerDiagnostics,
+    repeat_diagnostics: SharedRepeatProcessDiagnostics,
 ) {
     eprintln!("[AssetDb Watcher] worker {} thread started", index);
     while !stop.load(Ordering::Relaxed) {
@@ -1270,6 +1595,7 @@ fn worker_loop(
             Some(p) => p,
             None => continue,
         };
+        begin_worker_item(&diagnostics, index, &rel_path);
 
         // IMPORTANT: publish the current-file slot BEFORE the debounce sleep
         // so external observers (the asset page) see "processing X" for the
@@ -1285,11 +1611,23 @@ fn worker_loop(
             if let Ok(mut slot) = current.lock() {
                 *slot = None;
             }
+            finish_worker_item(&diagnostics, index, Some("stopped during debounce".to_string()));
             break;
         }
 
-        match process_dirty_asset(&rel_path, &project_root, &state, &stop) {
+        let mut last_error = None;
+        let mut cascade_count = 0usize;
+        match process_dirty_asset(
+            &rel_path,
+            &project_root,
+            &state,
+            &stop,
+            Some(&diagnostics),
+            Some(index),
+        ) {
             Ok(extra_paths) => {
+                set_worker_stage(&diagnostics, index, "enqueue cascade paths");
+                cascade_count = extra_paths.len();
                 for extra_path in extra_paths {
                     enqueue_with_activity(
                         &queue,
@@ -1301,16 +1639,24 @@ fn worker_loop(
                 }
             }
             Err(e) => {
+                last_error = Some(e.clone());
                 eprintln!(
                     "[AssetDb Watcher] worker {} error processing {}: {}",
                     index, rel_path, e
                 );
             }
         }
+        record_processed_path(
+            repeat_diagnostics.as_ref(),
+            &project_root,
+            &rel_path,
+            cascade_count,
+        );
 
         if let Ok(mut slot) = current.lock() {
             *slot = None;
         }
+        finish_worker_item(&diagnostics, index, last_error);
     }
     eprintln!("[AssetDb Watcher] worker {} thread stopped", index);
 }
@@ -1465,13 +1811,23 @@ fn mtime_scan_once_with_options(
         return;
     }
 
+    let scan_started = Instant::now();
+    eprintln!(
+        "[AssetDb Watcher Diag] mtime scan start: project_root={}, discover_new_meta={}, verify_hashes={}",
+        project_root.display(),
+        options.discover_new_meta,
+        options.verify_hashes
+    );
+
     let (asset_records, file_records): (Vec<db::AssetMtimeRecord>, Vec<db::FileMtimeRecord>) = {
+        eprintln!("[AssetDb Watcher Diag] mtime scan DB query start");
         let guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
         match &*guard {
             Some(graph) => {
+                let asset_query_started = Instant::now();
                 let mtimes = match db::get_all_asset_mtime_records(&graph.conn) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1479,13 +1835,25 @@ fn mtime_scan_once_with_options(
                         return;
                     }
                 };
-                let file_records = match db::get_all_file_mtime_records(&graph.conn) {
+                eprintln!(
+                    "[AssetDb Watcher Diag] mtime scan asset records loaded: count={}, elapsed_ms={}",
+                    mtimes.len(),
+                    asset_query_started.elapsed().as_millis()
+                );
+                let file_query_started = Instant::now();
+                let file_records: Vec<db::FileMtimeRecord> =
+                    match db::get_all_file_mtime_records(&graph.conn) {
                     Ok(v) => v.into_iter().collect(),
                     Err(e) => {
                         eprintln!("[AssetDb Watcher] file mtime query error: {}", e);
                         return;
                     }
                 };
+                eprintln!(
+                    "[AssetDb Watcher Diag] mtime scan file records loaded: count={}, elapsed_ms={}",
+                    file_records.len(),
+                    file_query_started.elapsed().as_millis()
+                );
                 (mtimes, file_records)
             }
             None => return,
@@ -1564,6 +1932,12 @@ fn mtime_scan_once_with_options(
 
         scan_completed += 1;
         if should_emit_reconcile_progress(scan_completed, scan_total) {
+            eprintln!(
+                "[AssetDb Watcher Diag] mtime scan asset progress: completed={} total={} queued={}",
+                scan_completed,
+                scan_total,
+                queue.len()
+            );
             emit_reconcile_progress(
                 on_progress,
                 StartupReconcileProgress {
@@ -1623,6 +1997,12 @@ fn mtime_scan_once_with_options(
 
         scan_completed += 1;
         if should_emit_reconcile_progress(scan_completed, scan_total) {
+            eprintln!(
+                "[AssetDb Watcher Diag] mtime scan file progress: completed={} total={} queued={}",
+                scan_completed,
+                scan_total,
+                queue.len()
+            );
             emit_reconcile_progress(
                 on_progress,
                 StartupReconcileProgress {
@@ -1656,6 +2036,8 @@ fn mtime_scan_once_with_options(
     let scan_roots = ["Assets", "Packages"];
     let mut linked_asset_roots = Vec::new();
     let mut linked_asset_rel_paths = HashSet::new();
+    let mut discovered_entries = 0u64;
+    let mut discovered_meta = 0u64;
     for root_name in &scan_roots {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1683,6 +2065,16 @@ fn mtime_scan_once_with_options(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            discovered_entries += 1;
+            if discovered_entries == 1 || discovered_entries % 10_000 == 0 {
+                eprintln!(
+                    "[AssetDb Watcher Diag] mtime scan discovery progress: root={}, entries={}, meta_files={}, queued={}",
+                    root_name,
+                    discovered_entries,
+                    discovered_meta,
+                    queue.len()
+                );
+            }
 
             record_linked_asset_root(
                 project_root,
@@ -1705,6 +2097,7 @@ fn mtime_scan_once_with_options(
             if ext != "meta" {
                 continue;
             }
+            discovered_meta += 1;
 
             let rel = abs_path
                 .strip_prefix(project_root)
@@ -1728,7 +2121,17 @@ fn mtime_scan_once_with_options(
     if stop.load(Ordering::Relaxed) {
         return;
     }
+    eprintln!(
+        "[AssetDb Watcher Diag] mtime scan refresh linked roots: roots={}, queued={}",
+        linked_asset_roots.len(),
+        queue.len()
+    );
     refresh_linked_asset_roots(state, linked_watch_state, linked_asset_roots);
+    eprintln!(
+        "[AssetDb Watcher Diag] mtime scan end: queued={}, elapsed_ms={}",
+        queue.len(),
+        scan_started.elapsed().as_millis()
+    );
 }
 
 fn queue_summary_logger_loop(
@@ -1894,6 +2297,12 @@ fn reconcile_loaded_db_with_options(
     options: MtimeScanOptions,
     on_progress: ReconcileProgressCallback<'_>,
 ) -> Result<(AssetDb, StartupReconcileStats), String> {
+    eprintln!(
+        "[AssetDb Watcher Diag] startup reconcile start: project_root={}, discover_new_meta={}, verify_hashes={}",
+        project_root.display(),
+        options.discover_new_meta,
+        options.verify_hashes
+    );
     let state = Arc::new(Mutex::new(Some(graph)));
     let stats = reconcile_graph_state_with_options(
         project_root,
@@ -2007,8 +2416,10 @@ fn reconcile_graph_state_with_options(
         }
 
         stats.processed += 1;
-        match process_dirty_asset(&rel_path, project_root, &state, stop) {
+        let item_started = Instant::now();
+        match process_dirty_asset(&rel_path, project_root, &state, stop, None, None) {
             Ok(cascade_paths) => {
+                let cascade_count = cascade_paths.len();
                 for request in cascade_paths {
                     if enqueue_with_activity(
                         &queue,
@@ -2019,6 +2430,21 @@ fn reconcile_graph_state_with_options(
                     ) {
                         stats.queued += 1;
                     }
+                }
+                let elapsed_ms = item_started.elapsed().as_millis();
+                if elapsed_ms >= SLOW_STAGE_LOG_MS
+                    || should_emit_reconcile_progress(stats.processed, stats.queued.max(stats.processed))
+                {
+                    eprintln!(
+                        "[AssetDb Watcher Diag] startup reconcile processed: path={}, elapsed_ms={}, cascade_paths={}, processed={}, queued_remaining={}, total_queued={}, failed={}",
+                        rel_path,
+                        elapsed_ms,
+                        cascade_count,
+                        stats.processed,
+                        queue.len(),
+                        stats.queued,
+                        stats.failed
+                    );
                 }
             }
             Err(error) => {
@@ -2046,6 +2472,11 @@ fn reconcile_graph_state_with_options(
         }
     }
 
+    eprintln!(
+        "[AssetDb Watcher Diag] startup reconcile end: queued={}, processed={}, failed={}",
+        stats.queued, stats.processed, stats.failed
+    );
+
     Ok(stats)
 }
 
@@ -2065,10 +2496,16 @@ impl AssetDbWatcher {
         graph_state: Arc<Mutex<Option<AssetDb>>>,
         tuning: Arc<WatcherTuning>,
     ) -> Result<Self, String> {
+        eprintln!(
+            "[AssetDb Watcher Diag] watcher startup start: project_root={}",
+            project_root.display()
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let dirty_queue = Arc::new(DirtyQueue::new());
         let current_file: CurrentFileSlot = Arc::new(Mutex::new(None));
         let recent_activity = Arc::new(RecentQueueActivityLog::new());
+        let worker_diagnostics = new_worker_diagnostics();
+        let repeat_diagnostics = Arc::new(RepeatProcessDiagnostics::default());
         let mut threads = Vec::new();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2131,6 +2568,23 @@ impl AssetDbWatcher {
             .map_err(|e| format!("Failed to spawn queue summary logger thread: {}", e))?;
         threads.push(log_thread);
 
+        let queue_watchdog = dirty_queue.clone();
+        let activity_watchdog = recent_activity.clone();
+        let stop_watchdog = stop.clone();
+        let diagnostics_watchdog = worker_diagnostics.clone();
+        let watchdog_thread = std::thread::Builder::new()
+            .name("refgraph-stage-watchdog".into())
+            .spawn(move || {
+                stage_watchdog_loop(
+                    diagnostics_watchdog,
+                    queue_watchdog,
+                    activity_watchdog,
+                    stop_watchdog,
+                );
+            })
+            .map_err(|e| format!("Failed to spawn stage watchdog thread: {}", e))?;
+        threads.push(watchdog_thread);
+
         for index in 0..MAX_WORKER_THREADS {
             let queue_wk = dirty_queue.clone();
             let stop_wk = stop.clone();
@@ -2139,6 +2593,8 @@ impl AssetDbWatcher {
             let current_wk = current_file.clone();
             let tuning_wk = tuning.clone();
             let activity_wk = recent_activity.clone();
+            let diagnostics_wk = worker_diagnostics.clone();
+            let repeat_diagnostics_wk = repeat_diagnostics.clone();
             let worker_thread = std::thread::Builder::new()
                 .name(format!("refgraph-worker-{}", index))
                 .spawn(move || {
@@ -2151,6 +2607,8 @@ impl AssetDbWatcher {
                         current_wk,
                         tuning_wk,
                         activity_wk,
+                        diagnostics_wk,
+                        repeat_diagnostics_wk,
                     );
                 })
                 .map_err(|e| format!("Failed to spawn worker thread {}: {}", index, e))?;
@@ -2178,6 +2636,11 @@ impl AssetDbWatcher {
             .map_err(|e| format!("Failed to spawn mtime scanner thread: {}", e))?;
         threads.push(mtime_thread);
 
+        eprintln!(
+            "[AssetDb Watcher Diag] watcher startup end: project_root={}, max_workers={}",
+            project_root.display(),
+            MAX_WORKER_THREADS
+        );
         eprintln!("[AssetDb Watcher] started for {}", project_root.display());
 
         Ok(Self {
@@ -2756,7 +3219,8 @@ mod tests {
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.dequeue(&stop), Some(asset_path.to_string()));
-        process_dirty_asset(asset_path, &root, &state, &stop).expect("process stale resync");
+        process_dirty_asset(asset_path, &root, &state, &stop, None, None)
+            .expect("process stale resync");
 
         mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
         assert_eq!(queue.len(), 0);
@@ -2922,7 +3386,7 @@ mod tests {
         let graph = scan_test_graph(&root);
         let state = Arc::new(Mutex::new(Some(graph)));
         let stop = AtomicBool::new(false);
-        process_dirty_asset("Assets/Prefabs/Root.prefab", &root, &state, &stop)
+        process_dirty_asset("Assets/Prefabs/Root.prefab", &root, &state, &stop, None, None)
             .expect("process prefab");
 
         let guard = state.lock().expect("lock graph");
@@ -3039,7 +3503,8 @@ mod tests {
         let state = Arc::new(Mutex::new(Some(graph)));
         let stop = AtomicBool::new(true);
 
-        process_dirty_asset(asset_path, &root, &state, &stop).expect("stopped processing");
+        process_dirty_asset(asset_path, &root, &state, &stop, None, None)
+            .expect("stopped processing");
 
         let guard = state.lock().expect("lock state");
         let graph = guard.as_ref().expect("graph still present");

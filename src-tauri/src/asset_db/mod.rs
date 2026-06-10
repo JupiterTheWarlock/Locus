@@ -286,6 +286,10 @@ impl AssetDb {
     {
         let start = std::time::Instant::now();
         let mut stats = ScanStats::default();
+        eprintln!(
+            "[AssetDb Watcher Diag] asset full scan start: project_root={}",
+            self.project_root.display()
+        );
 
         // Phase timing instrumentation. Each `phase_start` reset gives us one
         // wall-clock measurement we can compare across runs / projects to
@@ -874,6 +878,13 @@ impl AssetDb {
         eprintln!(
             "[AssetDb] scan complete: {} nodes, {} edges, {}ms",
             stats.nodes_added, stats.edges_added, stats.elapsed_ms
+        );
+        eprintln!(
+            "[AssetDb Watcher Diag] asset full scan end: nodes={}, edges={}, objects={}, elapsed_ms={}",
+            stats.nodes_added,
+            stats.edges_added,
+            objects_added,
+            stats.elapsed_ms
         );
         eprintln!(
             "[AssetDb][timing] TOTAL={}ms (dir_scan={}ms meta_par={}ms meta_mat={}ms script_idx={}ms script_bf={}ms yaml_par={}ms yaml_bf={}ms edge_prep={}ms db_write={}ms risk_reports={}ms)",

@@ -2502,18 +2502,37 @@ pub fn atomic_update_asset(
     new_edges: &[RefEdge],
     file_records: &[(String, FileRole, u64, u64, [u8; 16])],
 ) -> Result<(), String> {
+    atomic_update_asset_with_stage(conn, asset, objects, new_edges, file_records, |_| {})
+}
+
+pub fn atomic_update_asset_with_stage<F>(
+    conn: &mut Connection,
+    asset: &AssetNode,
+    objects: &[AssetObject],
+    new_edges: &[RefEdge],
+    file_records: &[(String, FileRole, u64, u64, [u8; 16])],
+    mut on_stage: F,
+) -> Result<(), String>
+where
+    F: FnMut(&'static str),
+{
+    on_stage("atomic update begin transaction");
     let tx = conn
         .transaction()
         .map_err(|e| format!("Failed to begin tx: {}", e))?;
 
+    on_stage("atomic update delete same-path conflicts");
     delete_same_path_asset_conflicts(&tx, asset)?;
 
+    on_stage("atomic update delete old edges");
     tx.execute(
         "DELETE FROM edges WHERE src_guid = ?1",
         params![asset.guid.as_slice()],
     )
     .map_err(|e| format!("Failed to delete old edges: {}", e))?;
+    on_stage("atomic update delete asset fts");
     asset_fts::delete_by_asset_guid(&tx, asset.guid.as_slice())?;
+    on_stage("atomic update delete object type terms");
     tx.execute(
         "DELETE FROM asset_object_type_terms
          WHERE object_key IN (
@@ -2522,6 +2541,7 @@ pub fn atomic_update_asset(
         params![asset.guid.as_slice()],
     )
     .map_err(|e| format!("Failed to delete old asset object type terms: {}", e))?;
+    on_stage("atomic update delete asset objects");
     tx.execute(
         "DELETE FROM asset_objects WHERE asset_guid = ?1",
         params![asset.guid.as_slice()],
@@ -2530,6 +2550,7 @@ pub fn atomic_update_asset(
 
     let (root, path_lower, file_name_lower, stem_lower) = derive_search_cols(&asset.path);
 
+    on_stage("atomic update insert asset");
     tx.execute(
         "INSERT OR REPLACE INTO assets
          (guid, path, ext, kind, exists_on_disk, mtime_ns, size,
@@ -2564,16 +2585,20 @@ pub fn atomic_update_asset(
     )
     .map_err(|e| format!("Failed to upsert asset: {}", e))?;
 
+    on_stage("atomic update insert main object");
     let main_object = object_index::main_asset_object(asset);
     insert_asset_object(&tx, &main_object)?;
+    on_stage("atomic update insert objects");
     for object in objects {
         insert_asset_object(&tx, object)?;
     }
 
+    on_stage("atomic update script inheritance terms");
     delete_script_inheritance_terms(&tx, &asset.guid)?;
     insert_script_inheritance_terms(&tx, asset)?;
 
     {
+        on_stage("atomic update prepare edge insert");
         let mut stmt = tx
             .prepare_cached(
                 "INSERT OR IGNORE INTO edges
@@ -2582,6 +2607,7 @@ pub fn atomic_update_asset(
             )
             .map_err(|e| format!("Failed to prepare edge insert: {}", e))?;
 
+        on_stage("atomic update insert edges");
         for edge in new_edges {
             stmt.execute(params![
                 edge.src_guid.as_slice(),
@@ -2596,6 +2622,7 @@ pub fn atomic_update_asset(
         }
     }
 
+    on_stage("atomic update insert files");
     for (path, role, mtime, size, hash) in file_records {
         tx.execute(
             "INSERT OR REPLACE INTO files (path, file_role, mtime_ns, size, hash128, owner_guid)
@@ -2612,6 +2639,7 @@ pub fn atomic_update_asset(
         .map_err(|e| format!("Failed to upsert file: {}", e))?;
     }
 
+    on_stage("atomic update commit");
     tx.commit()
         .map_err(|e| format!("Failed to commit: {}", e))?;
 
