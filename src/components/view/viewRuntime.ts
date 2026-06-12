@@ -147,6 +147,7 @@ import type {
   SessionRunSummary,
   SessionSummary,
   StreamEvent,
+  ModelOption,
 } from "../../types";
 import * as PropertyTreeService from "../../services/propertyTree";
 import * as UnityPropertyPathService from "../../services/unityPropertyPath";
@@ -280,6 +281,7 @@ export interface ViewRuntimeApi {
   undoSessionTurn(sessionId: string): Promise<SessionDetail>;
   rollbackSessionToMessage(sessionId: string, messageId: string): Promise<SessionDetail>;
   callLlm(request: ViewLlmCallRequest): Promise<ViewLlmCallResult>;
+  listModels(): Promise<ModelOption[]>;
   onSessionEvent(handler: (event: StreamEvent) => void): Promise<ViewRuntimeUnsubscribe>;
   readFrontendLog(limit?: number): Promise<ViewFrontendLogEntry[]>;
   openFrontendLog(): Promise<void>;
@@ -1633,6 +1635,9 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
   const llm = {
     call: (request: ViewLlmCallRequest) => api.callLlm(request),
   };
+  const models = {
+    list: () => api.listModels(),
+  };
 
   const storage = {
     get: (key: string) => api.storageGet(key),
@@ -1713,6 +1718,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     },
     session,
     llm,
+    models,
     storage,
     fs,
     path,
@@ -1730,6 +1736,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     view,
     session,
     llm,
+    models,
     storage,
     fs,
     path,
@@ -2141,6 +2148,8 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
         promptLength: request.prompt?.length ?? 0,
         wait: !!request.wait,
       }),
+    listModels: () =>
+      measureRequest("listModels", () => api.listModels(), {}, "data"),
     onSessionEvent: (handler) =>
       measureRequest("onSessionEvent", () => api.onSessionEvent(handler), {}, "subscription"),
     readFrontendLog: (limit) =>

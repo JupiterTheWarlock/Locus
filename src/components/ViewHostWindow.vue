@@ -31,6 +31,7 @@ import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import { getLastEffort, getLastModel, getModelDefaults } from "../services/model";
 import { markStartupPhase } from "../services/startupPerf";
+import { useModelStore } from "../stores/model";
 import {
   archiveSession,
   chat as launchSessionChat,
@@ -121,6 +122,7 @@ import type {
 } from "../types";
 import { createViewRuntimeComponent } from "./view/viewRuntime";
 
+const modelStore = useModelStore();
 const CONSOLE_LOG_LEVELS: ViewFrontendLogLevel[] = ["debug", "log", "info", "warn", "error"];
 const AUTOMATION_REQUEST_TTL_MS = 120_000;
 const VIEW_HOST_TABS_MERGE_EVENT = "view-host-tabs-merge";
@@ -1936,6 +1938,17 @@ async function resolveViewModel(model?: string | null): Promise<string | null> {
   return defaultModel ?? lastModel;
 }
 
+async function listRuntimeModels() {
+  await Promise.allSettled([
+    modelStore.loadModelDefaults(),
+    modelStore.loadCustomEndpoints(),
+    modelStore.loadCodexModelConfig(),
+    modelStore.loadCodexAvailableModels(),
+  ]);
+  modelStore.resolveSelectedModel();
+  return modelStore.availableModels.map((model) => ({ ...model }));
+}
+
 async function resolveViewEffort(effort?: string | null): Promise<string | null> {
   const explicit = nonEmptyString(effort);
   if (explicit) return explicit;
@@ -2602,6 +2615,7 @@ async function loadView(
             rollbackSessionToMessage: (sessionId, messageId) =>
               rollbackSessionToMessage(sessionId, messageId),
             callLlm: (request) => callRuntimeLlm(request),
+            listModels: () => listRuntimeModels(),
             onSessionEvent: (handler) =>
               getLocusRuntime().subscribe<StreamEvent>("stream-event", handler),
             readFrontendLog: (limit) => viewReadFrontendLog({ viewId: next.manifest.id, limit }),
