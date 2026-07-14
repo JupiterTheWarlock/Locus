@@ -11,7 +11,6 @@ import type {
   CodexModelConfig,
   CodexTransportMode,
 } from "../types";
-import { filterVisibleModels } from "../config/providerVisibility";
 import { modelSupportsFastMode } from "../utils/modelDisplay";
 
 const CLAUDE_CONTEXT_1M = 1_000_000;
@@ -288,12 +287,10 @@ export const useModelStore = defineStore("model", () => {
       provider: "custom" as const,
       supportedEfforts: normalizeCustomReasoningEfforts(ep.supportedReasoningEfforts),
     }));
-    // Claude Code CLI models are opt-in: they only join the list after the
-    // user explicitly enables them in model configuration.
-    const models = [...builtinModels, ...codexModels.value, ...customs].filter(
+    // Claude Code CLI models are opt-in through Settings > Experimental.
+    return [...builtinModels, ...codexModels.value, ...customs].filter(
       (m) => m.provider !== "claude_code" || modelDefaults.value.claudeCodeEnabled === true,
     );
-    return filterVisibleModels(models);
   });
 
   const availableModels = computed(() => {

@@ -66,7 +66,6 @@ import type {
   CodexModelConfig,
 } from "../types";
 import { t } from "../i18n";
-import { filterVisibleProviders } from "../config/providerVisibility";
 import { useCopyFeedback } from "./useCopyFeedback";
 import { setThemePreference } from "./useTheme";
 
@@ -397,7 +396,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "experimental" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);
@@ -426,7 +425,7 @@ export function useSettingsState(emit: SettingsEmit) {
 
   async function loadProviders() {
     try {
-      providers.value = filterVisibleProviders(await getProviders() as ProviderStatus[]);
+      providers.value = await getProviders() as ProviderStatus[];
     } catch (e) {
       console.error("get_providers failed:", e);
       const err = normalizeAppError(e);
