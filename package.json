@@ -2,7 +2,7 @@
   "name": "locus",
   "private": true,
   "license": "GPL-3.0-or-later",
-  "version": "0.5.8",
+  "version": "0.6.0",
   "releaseChannel": "stable",
   "type": "module",
   "scripts": {
@@ -31,6 +31,7 @@
     "github-cli:bundle": "bun run scripts/prepare-managed-github-cli.mjs",
     "ort:bundle": "bun run scripts/prepare-ort-runtime.mjs",
     "licenses:bundle": "bun run scripts/generate-third-party-bundle.mjs",
+    "catalog:refresh": "bun run scripts/refresh-model-catalog.mjs",
     "view-runtime:export": "bun run scripts/export-view-runtime-sources.mjs",
     "preview": "vite preview",
     "tauri": "bun run scripts/run-tauri.mjs",

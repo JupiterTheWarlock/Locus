@@ -19,7 +19,7 @@ import {
   getProviders,
   codexStatus as fetchCodexStatus,
 } from "../services/auth";
-import { getModelDefaults, getCustomEndpoints } from "../services/model";
+import { getModelDefaults, getCustomProviders } from "../services/model";
 import { getToolPermissions } from "../services/permissions";
 import {
   gitProbe,
@@ -201,7 +201,7 @@ export function useAppBootstrap() {
         modelStore.loadModelDefaults(),
         modelStore.loadLastModel(),
         modelStore.loadCodexFastMode(),
-        modelStore.loadCustomEndpoints(),
+        modelStore.loadCustomProviders(),
         modelStore.loadCodexModelConfig(),
       ]);
     });
@@ -359,12 +359,12 @@ export function useAppBootstrap() {
   function warmupSettings(generation: number): Promise<void> {
     if (_wpSettings) return _wpSettings;
     _wpSettings = (async () => {
-      const [providers, codex, defaults, perms, endpoints] = await Promise.all([
+      const [providers, codex, defaults, perms, customProviders] = await Promise.all([
         getProviders(),
         fetchCodexStatus(),
         getModelDefaults(),
         getToolPermissions(),
-        getCustomEndpoints(),
+        getCustomProviders(),
       ]);
       setWarmup(
         "settings:providers",
@@ -374,7 +374,7 @@ export function useAppBootstrap() {
       setWarmup("settings:codexStatus", codex, generation);
       setWarmup("settings:modelDefaults", defaults, generation);
       setWarmup("settings:toolPermissions", perms, generation);
-      setWarmup("settings:customEndpoints", endpoints, generation);
+      setWarmup("settings:customProviders", customProviders, generation);
     })();
     return _wpSettings;
   }
@@ -582,7 +582,11 @@ export function useAppBootstrap() {
         measureWorkspaceSwitchAsync("load_asset_db_status", () => projectStore.loadAssetDbStatus(), {
           target: path,
         }),
-        measureWorkspaceSwitchAsync("load_skills", () => loadSkills(), { target: path }),
+        // force: a non-forced call would adopt a still-in-flight scan from
+        // the previous workspace and commit its stale skill list here.
+        measureWorkspaceSwitchAsync("load_skills", () => loadSkills({ force: true }), {
+          target: path,
+        }),
       ]);
     } finally {
       console.info(
@@ -613,7 +617,7 @@ export function useAppBootstrap() {
       modelStore.loadModelDefaults(),
       modelStore.loadLastModel(),
       modelStore.loadCodexFastMode(),
-      modelStore.loadCustomEndpoints(),
+      modelStore.loadCustomProviders(),
       modelStore.loadCodexModelConfig(),
     ]);
     await modelStore.loadCodexAvailableModels();

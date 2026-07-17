@@ -5,7 +5,7 @@ import type {
   ModelOption,
   ModelDefaults,
   AgentInfo,
-  CustomEndpoint,
+  CustomProvider,
   CodexModelConfig,
 } from "../types";
 import { t, locale, setLocale } from "../i18n";
@@ -19,10 +19,11 @@ import AboutSettings from "./settings/AboutSettings.vue";
 import ProxySettings from "./settings/ProxySettings.vue";
 import ExperimentalFeaturesSettings from "./settings/ExperimentalFeaturesSettings.vue";
 import ApiProviders from "./settings/ApiProviders.vue";
-import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
+import CustomProviderModal from "./settings/CustomProviderModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
 import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
+import McpSettings from "./settings/McpSettings.vue";
 import HotReloadSettings from "./settings/HotReloadSettings.vue";
 import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
 import TestingSettings from "./settings/TestingSettings.vue";
@@ -40,7 +41,7 @@ const emit = defineEmits<{
   authChanged: [];
   modelDefaultsChanged: [defaults: ModelDefaults];
   codexTransportChanged: [config: CodexModelConfig];
-  customEndpointsChanged: [endpoints: CustomEndpoint[]];
+  customProvidersChanged: [providers: CustomProvider[]];
   resetOnboarding: [];
 }>();
 
@@ -50,6 +51,7 @@ const {
   claudeCodeTestStatus, claudeCodeTestResult, testClaudeCode,
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
+  anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
   oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
   codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits, consumeCodexResetCredit,
   requestCodexLogin,
@@ -57,8 +59,9 @@ const {
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
   fileToolWorkspaceBoundary, fileToolWorkspaceBoundaryReady, fileToolWorkspaceBoundaryBusy,
   setToolPermission, setFileToolWorkspaceBoundaryEnabled,
-  customEndpoints, editingEndpoint, isAddingEndpoint, customEndpointSaving, testStatus, testResult,
-  startAddEndpoint, startEditEndpoint, cancelEditEndpoint, saveEndpoint, deleteEndpoint, testEndpoint,
+  customProviders, editingCustomProvider, isAddingCustomProvider, customProviderSaving, testStatus, testResult,
+  modelCatalog, modelCatalogLoading, modelCatalogRefreshing, loadModelCatalog, refreshCatalog,
+  startAddCustomProvider, startEditCustomProvider, cancelEditCustomProvider, saveCustomProvider, deleteCustomProvider, testCustomProvider,
 } = useSettingsState(emit);
 
 const uiStore = useUiStore();
@@ -157,6 +160,16 @@ watch(
             <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
           </svg>
           <span>{{ t("settings.tab.permissions") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'mcp' }"
+          @click="activeCategory = 'mcp'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M6 3.5A1.5 1.5 0 0 1 7.5 2h1A1.5 1.5 0 0 1 10 3.5v1A1.5 1.5 0 0 1 8.5 6v1H14a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0V8h-5v.5a.5.5 0 0 1-1 0V8h-5v.5a.5.5 0 0 1-1 0v-1A.5.5 0 0 1 2 7h5.5V6A1.5 1.5 0 0 1 6 4.5v-1zM8.5 5a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1zM0 11.5A1.5 1.5 0 0 1 1.5 10h1A1.5 1.5 0 0 1 4 11.5v1A1.5 1.5 0 0 1 2.5 14h-1A1.5 1.5 0 0 1 0 12.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1zm4.5.5A1.5 1.5 0 0 1 7.5 10h1a1.5 1.5 0 0 1 1.5 1.5v1A1.5 1.5 0 0 1 8.5 14h-1A1.5 1.5 0 0 1 6 12.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1zm4.5.5a1.5 1.5 0 0 1 1.5-1.5h1a1.5 1.5 0 0 1 1.5 1.5v1a1.5 1.5 0 0 1-1.5 1.5h-1a1.5 1.5 0 0 1-1.5-1.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1z"/>
+          </svg>
+          <span>{{ t("settings.tab.mcp") }}</span>
         </button>
         <div class="sidebar-group-label">{{ t("settings.group.general") }}</div>
         <button
@@ -276,12 +289,14 @@ watch(
           :codex-transport="codexModelConfig.transport"
           :dynamic-tool-loading-mode="dynamicToolLoadingMode"
           :dynamic-tool-loading-busy="dynamicToolLoadingBusy"
+          :anthropic-native-lazy-enabled="anthropicNativeLazyEnabled"
+          :anthropic-native-lazy-busy="anthropicNativeLazyBusy"
           :codex-user-code="codexUserCode"
           :codex-url="codexUrl"
           :codex-code-copied="codexCodeCopied"
           :all-models="allModels"
-          :custom-endpoints="customEndpoints"
-          :custom-endpoint-saving="customEndpointSaving"
+          :custom-providers="customProviders"
+          :custom-provider-saving="customProviderSaving"
           :claude-code-enabled="modelDefaults.claudeCodeEnabled === true"
           :claude-code-test-status="claudeCodeTestStatus"
           :claude-code-test-result="claudeCodeTestResult"
@@ -308,9 +323,10 @@ watch(
           @copy-code="copyCode"
           @update:codex-transport="setCodexTransportMode"
           @update:dynamic-tool-loading-mode="setDynamicToolLoadingMode"
-          @start-add-endpoint="startAddEndpoint"
-          @start-edit-endpoint="startEditEndpoint"
-          @delete-endpoint="deleteEndpoint"
+          @update:anthropic-native-lazy-enabled="setAnthropicNativeLazyEnabled"
+          @start-add-provider="startAddCustomProvider"
+          @start-edit-provider="startEditCustomProvider"
+          @delete-provider="deleteCustomProvider"
           @update:edit-key="editKey = $event"
           @update:oauth-code="oauthCode = $event"
         />
@@ -326,6 +342,10 @@ watch(
           @update:model-defaults="modelDefaults = $event"
           @save="saveModelDefaults"
         />
+      </template>
+
+      <template v-if="activeCategory === 'mcp'">
+        <McpSettings />
       </template>
 
       <template v-if="activeCategory === 'permissions'">
@@ -409,15 +429,20 @@ watch(
       <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
     </div><!-- end settings-content -->
 
-    <CustomEndpointModal
-      v-model:endpoint="editingEndpoint"
-      :is-adding="isAddingEndpoint"
-      :saving="customEndpointSaving"
+    <CustomProviderModal
+      v-model:provider="editingCustomProvider"
+      :is-adding="isAddingCustomProvider"
+      :saving="customProviderSaving"
       :test-status="testStatus"
       :test-result="testResult"
-      @close="cancelEditEndpoint"
-      @save="saveEndpoint"
-      @test="testEndpoint"
+      :catalog="modelCatalog"
+      :catalog-loading="modelCatalogLoading"
+      :catalog-refreshing="modelCatalogRefreshing"
+      @close="cancelEditCustomProvider"
+      @save="saveCustomProvider"
+      @test="testCustomProvider"
+      @open-catalog="loadModelCatalog()"
+      @refresh-catalog="refreshCatalog"
     />
 
   </div>

@@ -120,6 +120,7 @@ pub(crate) fn exit_app(app_handle: &AppHandle) {
     }
     crate::csharp_lsp::kill_active_server_for_exit();
     crate::csharp_compile::kill_active_server_for_exit();
+    crate::mcp::manager::kill_all_for_exit();
     crate::commands::destroy_unity_embed_control_window_on_main(app_handle);
     app_handle.exit(0);
 }
@@ -155,6 +156,23 @@ pub fn set_dynamic_tool_loading_mode(
 ) -> Result<(), crate::error::AppError> {
     config
         .set_dynamic_tool_loading_mode(value)
+        .map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
+pub fn get_anthropic_native_lazy_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.anthropic_native_lazy_enabled())
+}
+
+#[tauri::command]
+pub fn set_anthropic_native_lazy_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<(), crate::error::AppError> {
+    config
+        .set_anthropic_native_lazy_enabled(value)
         .map_err(crate::error::AppError::from)
 }
 

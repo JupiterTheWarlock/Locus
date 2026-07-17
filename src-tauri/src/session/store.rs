@@ -224,21 +224,29 @@ fn build_deleted_tool_result_message(path: &Path) -> String {
     )
 }
 
+/// Head+tail preview: CLI output puts errors and final results at the END, so
+/// a prefix-only preview hides exactly what the agent needs before it decides
+/// whether to Read the full file.
 fn estimate_preview(content: &str, max_chars: usize) -> (String, bool) {
-    let mut preview = String::new();
-    let mut count = 0usize;
-    let mut has_more = false;
-
-    for ch in content.chars() {
-        if count >= max_chars {
-            has_more = true;
-            break;
-        }
-        preview.push(ch);
-        count += 1;
+    let total = content.chars().count();
+    if total <= max_chars {
+        return (content.to_string(), false);
     }
 
-    (preview, has_more)
+    let head_chars = max_chars / 2;
+    let tail_chars = max_chars - head_chars;
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content
+        .chars()
+        .skip(total - tail_chars)
+        .collect();
+    let preview = format!(
+        "{}\n\n... [{} chars omitted, see full output file] ...\n\n{}",
+        head,
+        total - head_chars - tail_chars,
+        tail
+    );
+    (preview, true)
 }
 
 fn tool_result_threshold(tool_name: &str) -> Option<usize> {
@@ -274,14 +282,12 @@ pub fn build_large_tool_result_message(result: &PersistedToolResult) -> String {
         result.filepath.display()
     ));
     message.push_str("Use the Read tool with this exact path if you need the full output.\n\n");
-    message.push_str(&format!(
-        "Preview (first {} chars):\n",
-        result.preview.chars().count()
-    ));
-    message.push_str(&result.preview);
     if result.has_more {
-        message.push_str("\n...");
+        message.push_str("Preview (head and tail of the output):\n");
+    } else {
+        message.push_str("Preview:\n");
     }
+    message.push_str(&result.preview);
     message.push('\n');
     message.push_str(LARGE_RESULT_TAG_CLOSE);
     message
@@ -520,20 +526,34 @@ impl SessionStore {
         // session data with the v7+ schema contract.
         if db_path.is_file() {
             if let Ok(probe) = Connection::open(&db_path) {
-                let ver: i32 = probe
-                    .pragma_query_value(None, "user_version", |row| row.get(0))
-                    .unwrap_or(0);
+                // Only a successfully-read pre-baseline version may delete
+                // the database. A transient probe failure (antivirus holding
+                // the file, hot journal recovery, I/O hiccup) must not be
+                // mistaken for "version 0" — that would wipe every session.
+                // Keep the file and let the normal open below surface the
+                // error instead.
+                let ver: Result<i32, _> =
+                    probe.pragma_query_value(None, "user_version", |row| row.get(0));
                 drop(probe);
-                if ver < Self::MIN_MIGRATABLE_SCHEMA_VERSION {
-                    eprintln!(
-                        "[Locus] session db version {} < minimum migratable {}, deleting for fresh start",
-                        ver,
-                        Self::MIN_MIGRATABLE_SCHEMA_VERSION
-                    );
-                    let _ = std::fs::remove_file(&db_path);
-                    // Also remove WAL/SHM leftovers
-                    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
-                    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+                match ver {
+                    Ok(ver) if ver < Self::MIN_MIGRATABLE_SCHEMA_VERSION => {
+                        eprintln!(
+                            "[Locus] session db version {} < minimum migratable {}, deleting for fresh start",
+                            ver,
+                            Self::MIN_MIGRATABLE_SCHEMA_VERSION
+                        );
+                        let _ = std::fs::remove_file(&db_path);
+                        // Also remove WAL/SHM leftovers
+                        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+                        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "[Locus] session db version probe failed ({}); keeping database file",
+                            error
+                        );
+                    }
                 }
             }
         }
@@ -2123,6 +2143,33 @@ impl SessionStore {
             let _ = std::fs::remove_dir_all(&tool_dir);
         }
         Ok(())
+    }
+
+    /// Reclaim file space left behind by deleted sessions. The CASCADE
+    /// deletes on messages/events only move pages onto the SQLite freelist;
+    /// the file itself never shrinks. Cheap (three PRAGMA lookups) unless
+    /// the fragmentation thresholds trip.
+    pub fn vacuum_if_fragmented(&self) -> Result<Option<u64>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        crate::sqlite_maint::vacuum_if_fragmented(
+            &conn,
+            crate::sqlite_maint::VACUUM_MIN_FREE_BYTES,
+            crate::sqlite_maint::VACUUM_MIN_FREE_RATIO,
+        )
+    }
+
+    /// Fire-and-forget [`Self::vacuum_if_fragmented`] on a dedicated thread;
+    /// the connection mutex serializes it against normal store traffic. Used
+    /// after startup and after session deletion.
+    pub fn spawn_vacuum_if_fragmented(self: Arc<Self>) {
+        std::thread::spawn(move || match self.vacuum_if_fragmented() {
+            Ok(Some(freed_bytes)) => eprintln!(
+                "[Locus] session db vacuum reclaimed {} MB",
+                freed_bytes / (1024 * 1024)
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!("[Locus] session db vacuum failed: {}", error),
+        });
     }
 
     /// All session ids across every workspace, including archived sessions.
@@ -4021,7 +4068,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_large_tool_result_message, PersistedToolResult, SessionStore,
+        build_large_tool_result_message, estimate_preview, PersistedToolResult, SessionStore,
         CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER, RUN_STATUS_CANCELLING,
         RUN_STATUS_DONE,
     };
@@ -4042,6 +4089,23 @@ mod tests {
         .optional()
         .expect("query sqlite master")
         .is_some()
+    }
+
+    #[test]
+    fn estimate_preview_returns_short_content_unchanged() {
+        let (preview, has_more) = estimate_preview("hello", 10);
+        assert_eq!(preview, "hello");
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn estimate_preview_keeps_head_and_tail_of_large_output() {
+        let content = format!("BEGIN{}FATAL: the real error", "x".repeat(5000));
+        let (preview, has_more) = estimate_preview(&content, 100);
+        assert!(has_more);
+        assert!(preview.starts_with("BEGIN"));
+        assert!(preview.ends_with("FATAL: the real error"));
+        assert!(preview.contains("chars omitted"));
     }
 
     #[test]
@@ -4120,6 +4184,82 @@ mod tests {
         assert!(!store
             .take_plan_exited_notice(&session_id)
             .expect("no notice"));
+    }
+
+    #[test]
+    fn vacuum_reclaims_space_after_session_deletion() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("vacuum test", None, None, "chat", None)
+            .expect("create session");
+
+        // ~24 MB of message payload, comfortably past the 16 MB floor.
+        let payload = "x".repeat(1024 * 1024);
+        for _ in 0..24 {
+            store
+                .add_message(&session_id, MessageRole::Assistant, &payload)
+                .expect("add message");
+        }
+
+        // Live data is not fragmentation; nothing to reclaim yet.
+        assert!(store
+            .vacuum_if_fragmented()
+            .expect("check clean store")
+            .is_none());
+
+        store.delete_session(&session_id).expect("delete session");
+
+        let db_path = dir.path().join("locus.db");
+        let before = std::fs::metadata(&db_path).expect("stat db").len();
+        let freed = store.vacuum_if_fragmented().expect("vacuum");
+        assert!(
+            freed.is_some_and(|bytes| bytes > 0),
+            "expected vacuum to run after bulk deletion"
+        );
+        let after = std::fs::metadata(&db_path).expect("stat db").len();
+        assert!(
+            after < before,
+            "db file should shrink: before={} after={}",
+            before,
+            after
+        );
+    }
+
+    #[test]
+    fn unreadable_session_db_is_preserved_rather_than_deleted() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").expect("write garbage");
+
+        let result = SessionStore::new(dir.path());
+        assert!(result.is_err(), "opening a corrupt db must fail loudly");
+        assert!(
+            db_path.is_file(),
+            "a failed version probe must not delete the session database"
+        );
+    }
+
+    #[test]
+    fn pre_baseline_session_db_is_deleted_for_fresh_start() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        {
+            let conn = Connection::open(&db_path).expect("create old db");
+            conn.execute_batch("CREATE TABLE legacy (id INTEGER); PRAGMA user_version = 3;")
+                .expect("write pre-baseline schema");
+        }
+
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        drop(store);
+
+        // The pre-v7 file was dropped and recreated at the latest schema.
+        let conn = Connection::open(&db_path).expect("reopen db");
+        let ver: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read version");
+        assert_eq!(ver, SessionStore::SCHEMA_VERSION);
+        assert!(!table_exists(&conn, "legacy"));
     }
 
     #[test]

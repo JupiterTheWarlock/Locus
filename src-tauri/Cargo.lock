@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "locus"
-version = "0.5.8"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "aisdk",
@@ -3103,6 +3103,7 @@ dependencies = [
  "dirs 5.0.1",
  "dunce",
  "fastembed",
+ "flate2",
  "font-kit",
  "futures",
  "glob",
